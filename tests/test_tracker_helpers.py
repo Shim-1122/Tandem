@@ -37,6 +37,8 @@ def test_frame_agreement_zero_for_consistent_landmarks_without_rotation():
     pose, hand = forward_arm(ang, "right")
     out = frame_agreement_deg(pose, hand, "right")
     assert out["long_axis_deg"] == pytest.approx(0, abs=1e-6)
+    assert out["hand_vs_forearm_deg"] == pytest.approx(np.degrees(np.arccos(
+        np.cos(np.radians(10)) * np.cos(np.radians(5)))), abs=1e-6)   # wrist flexion 10, deviation 5
     assert out["palm_normal_deg"] == pytest.approx(0, abs=1e-6)
 
 
@@ -47,3 +49,18 @@ def test_frame_agreement_flags_a_rotated_hand_frame():
     c, s = np.cos(np.radians(40)), np.sin(np.radians(40))
     rotated = hand @ np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]]).T   # hand axes 40 degrees off the pose axes
     assert frame_agreement_deg(pose, rotated, "right")["long_axis_deg"] > 10
+
+
+def test_hand_vs_forearm_zero_with_straight_wrist_and_large_when_hand_axes_rotated():
+    ang = dict(shoulder_flexion=30, shoulder_abduction=15, shoulder_rotation=20, elbow_flexion=80,
+               forearm_rotation=40, wrist_flexion=0, wrist_deviation=0)
+    pose, hand = forward_arm(ang, "right")
+    assert frame_agreement_deg(pose, hand, "right")["hand_vs_forearm_deg"] == pytest.approx(0, abs=1e-6)
+    # rotate the hand landmarks 50 degrees about an axis perpendicular to the hand's long axis
+    from vtrack.kinematics import shortest_arc
+    long_axis = (hand[9] - hand[0]) / np.linalg.norm(hand[9] - hand[0])
+    k = np.cross(long_axis, [0.0, 0.0, 1.0])
+    k /= np.linalg.norm(k)
+    target = np.cos(np.radians(50)) * long_axis + np.sin(np.radians(50)) * np.cross(k, long_axis)
+    rotated = hand @ shortest_arc(long_axis, target).T
+    assert frame_agreement_deg(pose, rotated, "right")["hand_vs_forearm_deg"] == pytest.approx(50, abs=1e-6)

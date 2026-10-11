@@ -65,6 +65,7 @@ def main():
         last_ts = ts
         res = tracker.process(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB), ts)
         lines, gesture, ang, cmd = [], Gesture.UNKNOWN.value, ArmAngles(), float("nan")
+        hips_seen, up_hint = True, None
         hand = pick_hand(res, a.side)
         hand_w = hand_smooth(hand.world, t) if hand is not None else None
         if hand_w is not None:
@@ -72,10 +73,13 @@ def main():
             gesture = debounce.current.value
         if res.pose_world is not None:
             pose_w = pose_smooth(res.pose_world, t)
-            ang = kin.solve(pose_w, None if a.pose_only_wrist else hand_w)
+            hips_seen = res.pose_visibility is not None and min(res.pose_visibility[23], res.pose_visibility[24]) > 0.5
+            up_hint = None if hips_seen else np.array([0.0, -1.0, 0.0])   # camera vertical (world y points down)
+            ang = kin.solve(pose_w, None if a.pose_only_wrist else hand_w, up_hint)
             cmd = elbow_slew(elbow_ch.command(ang.elbow_flexion), t)
             if want_check:
-                fwd = thorax_frame(pose_w)[0][:, 0]
+                fwd = thorax_frame(pose_w, up_hint)[0][:, 0]
+                print("hips visible:", hips_seen, "(if False, torso up is taken from the camera's vertical)")
                 print("torso forward in camera axes:", np.round(fwd, 2),
                       "(facing the camera, z should be clearly negative; if positive, the world axes are mirrored and"
                       " every sagittal sign is flipped)")
@@ -91,12 +95,18 @@ def main():
                     mark = "  (no hand)"
                 lines.append(f"{LABELS[k]}: {v:7.1f}{mark}")
         lines.append(f"gesture: {gesture}")
-        for i, text in enumerate(lines):
-            cv2.putText(bgr, text, (10, 24 + 22 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        if res.pose_world is not None and not hips_seen:
+            lines.append("hips not visible: torso up = camera vertical, keep the camera level")
         if writer:
             writer.writerow([f"{t:.3f}", gesture, *[round(getattr(ang, k), 2) for k in ANGLE_FIELDS],
                              int(ang.shoulder_rotation_valid), int(ang.wrist_valid), round(cmd, 3)])
-        cv2.imshow("vision-joint-tracker", cv2.flip(bgr, 1))
+        view = cv2.flip(bgr, 1)                    # mirror first, then draw text so it reads normally
+        scale = max(0.6, view.shape[1] / 1280 * 0.9)
+        step = int(34 * scale)
+        cv2.rectangle(view, (0, 0), (int(620 * scale), step * len(lines) + 12), (0, 0, 0), -1)
+        for i, text in enumerate(lines):
+            cv2.putText(view, text, (10, step * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 255, 0), 2)
+        cv2.imshow("vision-joint-tracker", view)
         key = cv2.waitKey(1) & 0xFF
         if key == ord("q"):
             break

@@ -82,11 +82,15 @@ def euler_yxz(R: np.ndarray) -> tuple[float, float, float]:
     return float(np.arctan2(R[0, 2], R[2, 2])), float(b), float(np.arctan2(R[1, 0], R[1, 1]))
 
 
-def thorax_frame(pose: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(R_t, origin): columns X forward, Y up, Z right, and the shoulder midpoint."""
+def thorax_frame(pose: np.ndarray, up_hint: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(R_t, origin): columns X forward, Y up, Z right, and the shoulder midpoint.
+
+    Up normally comes from the hips. Pass `up_hint` (an up direction in world axes, e.g. the camera's
+    vertical) when the hips are out of view and their landmarks are guesses.
+    """
     z = unit(pose[R_SHOULDER] - pose[L_SHOULDER])
     mid_sh = (pose[R_SHOULDER] + pose[L_SHOULDER]) / 2
-    y = mid_sh - (pose[R_HIP] + pose[L_HIP]) / 2
+    y = mid_sh - (pose[R_HIP] + pose[L_HIP]) / 2 if up_hint is None else np.asarray(up_hint, dtype=float)
     y = unit(y - np.dot(y, z) * z)
     x = np.cross(y, z)
     return np.column_stack([x, y, z]), mid_sh
@@ -127,14 +131,15 @@ class ArmKinematics:
             c = c * np.array([1.0, 1.0, -1.0])   # mirror the left arm into a right arm
         return c
 
-    def solve(self, pose: np.ndarray, hand: np.ndarray | None = None) -> ArmAngles:
+    def solve(self, pose: np.ndarray, hand: np.ndarray | None = None,
+              up_hint: np.ndarray | None = None) -> ArmAngles:
         """pose: (33, 3) world landmarks. hand: (21, 3) hand world landmarks or None.
 
         With hand=None the hand orientation comes from the pose's own pinky and index points,
         which is noisier. Hand landmarks and pose landmarks are assumed to share axis directions
         (both aligned with the camera); check this on real data with `frame_agreement_deg`.
         """
-        R_t, origin = thorax_frame(pose)
+        R_t, origin = thorax_frame(pose, up_hint)
         s_i, e_i, w_i = _SIDE[self.side]
         S, E, W = (self._to_thorax(pose[i] - origin, R_t) for i in (s_i, e_i, w_i))
 
@@ -199,17 +204,22 @@ class ArmKinematics:
 
 
 def frame_agreement_deg(pose: np.ndarray, hand: np.ndarray, side: str = "right") -> dict[str, float]:
-    """Angle between the hand axes measured from hand landmarks and from the pose's own hand points.
+    """Checks that hand and pose world landmarks share axis directions. Read in raw world axes.
 
-    Both are read in raw world axes with no mirroring. If hand and pose world landmarks do not share
-    axis directions, these angles are large (tens of degrees) even for a still, well tracked hand.
-    Run this on a few seconds of real data before trusting the wrist angles.
+    hand_vs_forearm_deg: angle between the hand's long axis (hand model) and the forearm (pose elbow
+        to wrist). With the wrist held straight (no flexion or deviation) this should be small,
+        under about 20 degrees. Elbow and wrist are among the pose model's best points, so this is
+        the check to trust.
+    long_axis_deg, palm_normal_deg: hand model versus the pose model's own pinky and index points.
+        Those pose points are rough, so large values here are expected and not conclusive.
     """
-    p, ix, pk = pose[_SIDE[side][2]], pose[POSE_INDEX[side]], pose[POSE_PINKY[side]]
+    s_i, e_i, w_i = _SIDE[side]
+    p, ix, pk = pose[w_i], pose[POSE_INDEX[side]], pose[POSE_PINKY[side]]
     py, px = p - (ix + pk) / 2, ix - pk
     hy, hx = hand[0] - hand[9], hand[5] - hand[17]
 
     def ang(u, v):
         return float(np.degrees(np.arccos(np.clip(np.dot(unit(u), unit(v)), -1.0, 1.0))))
 
-    return {"long_axis_deg": ang(py, hy), "palm_normal_deg": ang(np.cross(px, py), np.cross(hx, hy))}
+    return {"hand_vs_forearm_deg": ang(hand[9] - hand[0], pose[w_i] - pose[e_i]),
+            "long_axis_deg": ang(py, hy), "palm_normal_deg": ang(np.cross(px, py), np.cross(hx, hy))}

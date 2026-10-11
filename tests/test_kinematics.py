@@ -204,3 +204,17 @@ def test_lateral_pole_output_reproduces_the_true_shoulder_rotation(abd):
 
     assert np.allclose(R(out.shoulder_flexion, out.shoulder_abduction, out.shoulder_rotation),
                        R(10.0, abd, 55.0), atol=1e-9)
+
+
+def test_up_hint_replaces_hips_when_they_are_wrong():
+    ang = dict(BENT)
+    pose, hand = forward_arm(ang)
+    good = ArmKinematics("right").solve(pose, hand)
+    bad = pose.copy()
+    bad[L_HIP] += (0.3, 0.0, 0.0)                     # hips guessed 30 cm forward, as when out of view
+    bad[R_HIP] += (0.3, 0.0, 0.0)
+    wrong = ArmKinematics("right").solve(bad, hand)
+    fixed = ArmKinematics("right").solve(bad, hand, up_hint=np.array([0.0, 1.0, 0.0]))
+    assert abs(wrong.shoulder_flexion - good.shoulder_flexion) > 10
+    for k in KEYS:
+        assert getattr(fixed, k) == pytest.approx(getattr(good, k), abs=1e-6), k

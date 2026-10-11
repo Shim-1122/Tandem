@@ -26,7 +26,8 @@ python scripts/live.py --side right --record recordings/run1.csv
 ```
 
 Models (about 8 MB hand, 6 MB pose lite) download into `models/` on first run. Stand 1.5 to 2.5 m
-from the camera, facing it, with the tracked arm and torso in view. Press `c` in the window to print
+from the camera, facing it, with the tracked arm and torso in view, hips included. If the hips are out of view, the
+torso's up direction is taken from the camera's vertical instead, so keep the camera level. Press `c` in the window to print
 the hand/pose frame agreement check (see Verify first).
 
 ## Joint angles
@@ -63,8 +64,10 @@ reported with the wrist because the hand's orientation is what shows them.
 
 1. **Axes.** Face the camera, hold the hand still in view, and press `c`. The torso forward vector should have a clearly
    negative z (toward the camera); if not, the world axes are mirrored and every sagittal sign is flipped.
-   Then check frame agreement: the solver assumes hand and pose world landmarks share axis directions. If `long_axis_deg` or `palm_normal_deg` is more than about 15, hand orientation cannot be trusted with
-   the hand model; use `--pose-only-wrist`.
+   Then hold the wrist straight (hand in line with the forearm) and check `hand_vs_forearm_deg`: under about 20 means the
+   hand model and pose model agree on axes. Much larger means the wrist angles from the hand model cannot be trusted;
+   use `--pose-only-wrist`. `long_axis_deg` and `palm_normal_deg` compare against the pose model's rough finger points
+   and are expected to be larger.
 2. **Sign check.** Do each motion in the table and confirm the displayed sign.
 3. **Error against ground truth.** Compare against a goniometer or a leader arm before any control.
 
