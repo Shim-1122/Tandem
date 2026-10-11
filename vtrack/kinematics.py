@@ -107,6 +107,7 @@ class ArmAngles:
     wrist_deviation: float = np.nan
     shoulder_rotation_valid: bool = False   # False: held value, elbow too straight or arm straight up
     wrist_valid: bool = False               # False: no hand orientation available this frame
+    elbow_predicted: bool = False           # True: elbow was out of view and estimated (see elbow.py)
 
     def as_dict(self) -> dict[str, float]:
         return {f.name: getattr(self, f.name) for f in fields(self)}

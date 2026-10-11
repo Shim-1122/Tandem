@@ -34,7 +34,7 @@ def forward_arm(angles: dict, side: str = "right", body_rotation: np.ndarray | N
     body_rotation maps thorax axes (forward, up, right) into the camera's world axes.
     """
     c = arm_chain(angles, upper_arm, forearm, hand_len, knuckle_half)
-    S, E, W, mid_knuckle, idx, pnk = c["S"], c["E"], c["W"], c["K"], c["index"], c["pinky"]
+    E, W, mid_knuckle, idx, pnk = c["E"], c["W"], c["K"], c["index"], c["pinky"]
 
     mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
     R_w = np.eye(3) if body_rotation is None else body_rotation

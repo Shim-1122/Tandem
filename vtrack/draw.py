@@ -11,6 +11,7 @@ import math
 import numpy as np
 
 from .kinematics import rot_x, rot_y, rot_z
+from .fingers import hand_fk
 from .synthetic import arm_chain
 
 POSE_ARM_EDGES = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24), (23, 24),
@@ -67,10 +68,13 @@ def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-2
     return render_arms_panel({side: angles}, size, yaw_deg, pitch_deg, note)
 
 
-def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note=""):
+def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", fingers_by_side=None):
     """3D view of the torso and arms rebuilt from solved angles. Returns a BGR image.
 
     angles_by_side: {"right": ArmAngles or dict, "left": ...}; either side may be omitted or all NaN.
+    fingers_by_side: optional {side: (finger angles, hand geometry)} from fingers.py; when given, that
+    hand is drawn from the solved finger angles through forward kinematics instead of as a simple palm.
+    An arm whose elbow was predicted (out of view) is drawn in a darker shade.
     Drawn as a mirror view (your right arm on the right), matching the mirrored video. Small
     red/green/blue axes show each segment's frame: upper arm at the elbow, forearm at the wrist,
     hand at the knuckles.
@@ -113,11 +117,21 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         P = {k: c[k] * mirror for k in ("S", "E", "W", "K", "index", "pinky")}
         s, e, w, k, ix, pk = pr(P["S"], P["E"], P["W"], P["K"], P["index"], P["pinky"])
         col = ARM_COLORS[side]
+        if not isinstance(angles, dict) and getattr(angles, "elbow_predicted", False):
+            col = tuple(int(x * 0.5) for x in col)
         cv2.line(img, s, e, col, 4, cv2.LINE_AA)
         cv2.line(img, e, w, col, 4, cv2.LINE_AA)
         hand_col = YELLOW if wrist_ok else GREY
-        for a, b in ((w, ix), (w, pk), (ix, pk), (w, k)):
-            cv2.line(img, a, b, hand_col, 2, cv2.LINE_AA)
+        fing = (fingers_by_side or {}).get(side)
+        if fing is not None and wrist_ok:
+            Pf = hand_fk(*fing)
+            pts = (c["W"] + Pf @ c["R_hand"].T) * mirror
+            pp = pr(*pts)
+            for a, b in HAND_EDGES:
+                cv2.line(img, pp[a], pp[b], hand_col, 2, cv2.LINE_AA)
+        else:
+            for a, b in ((w, ix), (w, pk), (ix, pk), (w, k)):
+                cv2.line(img, a, b, hand_col, 2, cv2.LINE_AA)
         for p in (s, e, w):
             cv2.circle(img, p, 6, WHITE, -1, cv2.LINE_AA)
         for origin, R in ((P["E"], c["R_h"]), (P["W"], c["R_f"]), (P["K"], c["R_hand"])):
@@ -133,18 +147,33 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
     return img
 
 
-def render_hand_panel(world, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note=""):
-    """3D view of a hand from its world landmarks (camera axes: x right, y down, z away). BGR image."""
+def render_hand_panel(world, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", solved=None):
+    """3D view of a hand from its world landmarks (camera axes: x right, y down, z away). BGR image.
+
+    solved: optional (21, 3) hand rebuilt from the solved finger angles (same axes); drawn in yellow over
+    the raw landmarks (grey), so any mismatch between measurement and model is visible.
+    """
     cv2 = _cv2()
     img = np.full((size, size, 3), 25, np.uint8)
     if world is None:
         cv2.putText(img, "no hand", (20, size // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
         return img
-    pts = np.asarray(world, dtype=float) - np.asarray(world, dtype=float).mean(axis=0)
+    center = np.asarray(world, dtype=float).mean(axis=0)
     view = _view(yaw_deg, pitch_deg, "x")
-    px = _project(pts, view, (size // 2, size // 2), size * 2.2, horiz_axis=0, vert_axis=1, vert_sign=1.0)
+
+    def proj(points):
+        return _project(np.asarray(points, float) - center, view, (size // 2, size // 2), size * 2.2,
+                        horiz_axis=0, vert_axis=1, vert_sign=1.0)
+
+    px = proj(world)
+    raw_col = GREY if solved is not None else YELLOW
     for a, b in HAND_EDGES:
-        cv2.line(img, px[a], px[b], YELLOW, 2, cv2.LINE_AA)
+        cv2.line(img, px[a], px[b], raw_col, 2 if solved is None else 1, cv2.LINE_AA)
+    if solved is not None:
+        sp = proj(solved)
+        for a, b in HAND_EDGES:
+            cv2.line(img, sp[a], sp[b], YELLOW, 2, cv2.LINE_AA)
+        px = sp
     for p in px:
         cv2.circle(img, p, 4, WHITE, -1, cv2.LINE_AA)
     cv2.putText(img, "hand, 3D (camera view, rotated)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)

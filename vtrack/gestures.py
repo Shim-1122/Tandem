@@ -5,7 +5,7 @@ from enum import Enum
 
 import numpy as np
 
-from .geometry import FINGERS, WRIST, joint_angle
+from .geometry import FINGERS, joint_angle
 
 
 class Gesture(str, Enum):

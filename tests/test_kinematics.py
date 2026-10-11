@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from vtrack.geometry import L_ELBOW, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST
+from vtrack.geometry import L_HIP, L_SHOULDER, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST
 from vtrack.kinematics import ArmKinematics, euler_yxz, rot_x, rot_y, rot_z, shortest_arc
 from vtrack.synthetic import forward_arm
 
@@ -234,3 +234,19 @@ def test_arm_visible_reports_missing_joints():
     assert arm_visible(vis, "right") == ["elbow"]
     assert arm_visible(vis, "left") == []
     assert arm_visible(None) == ["shoulder", "elbow", "wrist"]
+
+
+# ---- helpers ----
+
+def test_euler_yxz_inverts_its_composition():
+    rng = np.random.default_rng(3)
+    for _ in range(100):
+        a, b, c = rng.uniform(-1.4, 1.4, 3)
+        assert euler_yxz(rot_y(a) @ rot_x(b) @ rot_z(c)) == pytest.approx((a, b, c), abs=1e-9)
+
+
+def test_shortest_arc_maps_a_to_b():
+    rng = np.random.default_rng(4)
+    for _ in range(50):
+        a, b = (v / np.linalg.norm(v) for v in rng.normal(size=(2, 3)))
+        assert shortest_arc(a, b) @ a == pytest.approx(b, abs=1e-9)
