@@ -7,6 +7,24 @@ from .geometry import L_ELBOW, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHO
 from .kinematics import POSE_INDEX, POSE_PINKY, rot_x, rot_y, rot_z
 
 
+def arm_chain(angles: dict, upper_arm=0.30, forearm=0.26, hand_len=0.09, knuckle_half=0.04) -> dict:
+    """Right-arm chain in thorax axes (X forward, Y up, Z right), shoulder at (0, 0, 0.2).
+
+    Returns points S, E, W, knuckle (middle), index, pinky and segment frames R_h (upper arm),
+    R_f (forearm without pronation) and R_hand. Mirror Z for a left arm.
+    """
+    d = {k: np.radians(v) for k, v in angles.items()}
+    R_h = rot_z(d["shoulder_flexion"]) @ rot_x(-d["shoulder_abduction"]) @ rot_y(d["shoulder_rotation"])
+    R_f = R_h @ rot_z(d["elbow_flexion"])
+    R_hand = R_f @ rot_y(d["forearm_rotation"]) @ rot_x(d["wrist_flexion"]) @ rot_z(d["wrist_deviation"])
+    S = np.array([0.0, 0.0, 0.2])
+    E = S - upper_arm * R_h[:, 1]
+    W = E + forearm * (R_f @ np.array([0.0, -1.0, 0.0]))
+    K = W - hand_len * R_hand[:, 1]
+    return {"S": S, "E": E, "W": W, "K": K, "index": K + knuckle_half * R_hand[:, 0],
+            "pinky": K - knuckle_half * R_hand[:, 0], "R_h": R_h, "R_f": R_f, "R_hand": R_hand}
+
+
 def forward_arm(angles: dict, side: str = "right", body_rotation: np.ndarray | None = None,
                 body_offset=(0.0, 0.0, 0.0), upper_arm=0.30, forearm=0.26, hand_len=0.09, knuckle_half=0.04):
     """Return (pose (33,3), hand (21,3)) for the given joint angles in degrees.
@@ -15,19 +33,8 @@ def forward_arm(angles: dict, side: str = "right", body_rotation: np.ndarray | N
     forearm_rotation, wrist_flexion, wrist_deviation. Only landmarks the solver reads are filled.
     body_rotation maps thorax axes (forward, up, right) into the camera's world axes.
     """
-    d = {k: np.radians(v) for k, v in angles.items()}
-    phi, alp, tau = d["shoulder_flexion"], d["shoulder_abduction"], d["shoulder_rotation"]
-    R_h = rot_z(phi) @ rot_x(-alp) @ rot_y(tau)          # sagittal, coronal, transverse
-    a = -R_h[:, 1]                                       # shoulder to elbow
-    R_f = R_h @ rot_z(d["elbow_flexion"])
-    R_hand = R_f @ rot_y(d["forearm_rotation"]) @ rot_x(d["wrist_flexion"]) @ rot_z(d["wrist_deviation"])
-
-    S = np.array([0.0, 0.0, 0.2])
-    E = S + upper_arm * a
-    W = E + forearm * (R_f @ np.array([0.0, -1.0, 0.0]))
-    y_hand, x_hand = R_hand[:, 1], R_hand[:, 0]
-    mid_knuckle = W - hand_len * y_hand
-    idx, pnk = mid_knuckle + knuckle_half * x_hand, mid_knuckle - knuckle_half * x_hand
+    c = arm_chain(angles, upper_arm, forearm, hand_len, knuckle_half)
+    S, E, W, mid_knuckle, idx, pnk = c["S"], c["E"], c["W"], c["K"], c["index"], c["pinky"]
 
     mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
     R_w = np.eye(3) if body_rotation is None else body_rotation

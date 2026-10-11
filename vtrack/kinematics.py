@@ -223,3 +223,14 @@ def frame_agreement_deg(pose: np.ndarray, hand: np.ndarray, side: str = "right")
 
     return {"hand_vs_forearm_deg": ang(hand[9] - hand[0], pose[w_i] - pose[e_i]),
             "long_axis_deg": ang(py, hy), "palm_normal_deg": ang(np.cross(px, py), np.cross(hx, hy))}
+
+
+def up_from_neutral(pose: np.ndarray, side: str = "right") -> np.ndarray:
+    """Torso up direction (world axes) captured while the upper arm hangs straight down at the side.
+
+    For desk use with the hips out of view: sit upright, let the tracked upper arm hang vertically
+    beside the torso (elbow bent 90 degrees, forearm forward, thumb up), and capture this once. Pass the
+    result as `up_hint` to `ArmKinematics.solve`. It assumes the camera and your torso stay put afterwards.
+    """
+    s_i, e_i, _ = _SIDE[side]
+    return unit(pose[s_i] - pose[e_i])

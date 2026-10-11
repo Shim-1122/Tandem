@@ -10,25 +10,61 @@ Pipeline: camera frame -> MediaPipe hand and pose landmarks (3D, meters) -> One 
 | --- | --- |
 | `vtrack/tracker.py` | MediaPipe Tasks wrapper (hand + pose, VIDEO mode), model download, hand-to-arm matching by position |
 | `vtrack/kinematics.py` | Seven joint angles per arm: shoulder 3 DOF, elbow 1 DOF, wrist 3 DOF, with validity flags |
-| `vtrack/synthetic.py` | Forward kinematics (angles to landmarks) for tests and for driving a simulated arm |
+| `vtrack/synthetic.py` | Forward kinematics (angles to landmarks and segment frames) for tests, the 3D panel, and a simulated arm |
+| `vtrack/draw.py` | Landmark wireframes and the 3D panels (arm rebuilt from solved angles, or the hand in POV mode) |
+| `vtrack/handpose.py` | POV mode: hand position and orientation relative to the camera (PnP), finger joint angles, zeroing |
 | `vtrack/geometry.py` | Lower level angle math: finger flexion, torso frame |
 | `vtrack/filters.py` | One Euro filter and a landmark smoother that resets after dropouts |
 | `vtrack/gestures.py` | Rule-based gestures (open palm, fist, point, peace, thumbs up) and a debouncer |
 | `vtrack/mapping.py` | Angle to 0..1 command mapping and a slew-rate limiter |
-| `scripts/live.py` | Webcam demo showing all seven angles, with optional CSV recording |
+| `scripts/live.py` | Live demo: wireframe on the video, 3D kinematics panel, angles, CSV recording |
 
 ## Run
 
 ```
 pip install -r requirements.txt
-python -m pytest                      # no camera needed
-python scripts/live.py --side right --record recordings/run1.csv
+python -m pytest                                        # no camera needed
+python scripts/live.py --side right                     # standing, hips in view
+python scripts/live.py --side right --torso desk        # seated at a desk, hips hidden
+python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
 ```
 
-Models (about 8 MB hand, 6 MB pose lite) download into `models/` on first run. Stand 1.5 to 2.5 m
-from the camera, facing it, with the tracked arm and torso in view, hips included. If the hips are out of view, the
-torso's up direction is taken from the camera's vertical instead, so keep the camera level. Press `c` in the window to print
-the hand/pose frame agreement check (see Verify first).
+Add `--record recordings/run1.csv` to any of these to save every frame. Models (about 8 MB hand, 6 MB
+pose lite) download into `models/` on first run.
+
+The window shows the video with the landmark wireframe (cyan body, yellow hands) on the left and a 3D
+panel on the right. In body mode the panel rebuilds your arm from the solved joint angles through forward
+kinematics, with red/green/blue axes for the upper arm, forearm and hand frames. It shows what the solver
+believes, so if it moves like your arm the kinematics are right, and if it disagrees with the video the
+angles are wrong.
+
+Keys (click the video window first): `q` quit, `w` toggle wireframe, `c` print checks to the terminal,
+`z` calibrate (see below).
+
+## Modes
+
+**Standing (`--torso auto`, default).** Stand 1.5 to 2.5 m from the camera, facing it, with the tracked arm
+and torso in view, hips included. Torso "up" comes from shoulders and hips.
+
+**Desk (`--torso desk`).** No hips needed. Shoulders and the tracked arm must be in view. Sit upright, let the
+tracked upper arm hang straight down beside your torso with the elbow bent 90 degrees, forearm forward and
+thumb up, and press `z`. That pose becomes zero, and the calibration removes the camera's tilt (a laptop
+screen leaned back 25 degrees would otherwise add 25 degrees of shoulder flexion). Press `z` again whenever
+you move the camera or your chair. If the upper arm is not hanging straight down when you press `z`, every
+flexion reading is offset by that amount. Before calibrating, the camera's vertical is used, so keep the
+camera level.
+
+**POV (`--mode pov`).** For a camera on your head or goggles. Your shoulders are not visible from there, so
+the arm joint angles cannot be measured; instead it tracks:
+- hand position relative to the camera in cm (right, down, away), from the hand landmarks and the camera's
+  field of view (`--fov`; laptop webcams are about 65 to 78, wide action cameras 110 or more),
+- hand motion and rotation relative to a zero pose you set with `z` (dx, dy, dz; twist, pitch, yaw),
+- flexion at every finger joint (MCP, PIP, DIP) and the gesture.
+
+That relative hand motion is what a robot's end effector would follow during teleoperation. Two limits:
+depth assumes an average-size hand (a bigger hand reads farther away), and because the camera moves with
+your head, head motion looks like hand motion unless the goggles also report head orientation (an IMU).
+MediaPipe's left/right label assumes a mirrored image; if POV mode follows the wrong hand, add `--swap-hands`.
 
 ## Joint angles
 
@@ -77,9 +113,10 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 ## Other conventions and limits
 
 - Angles use MediaPipe world landmarks (meters), not image coordinates.
-- `--side` is the person's own arm. A hand is matched to that arm by image position, not by MediaPipe's left/right label.
+- `--side` is the person's own arm. In body mode a hand is matched to that arm by image position, not by MediaPipe's left/right label.
 - One RGB camera gives estimated depth, so angles are most reliable when the arm moves across the camera view.
 - The command mapping stops at 0..1 per joint. Mapping to air muscle pressure needs a calibration curve per muscle.
 - The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once its axes are decided.
-- Tested: 50 unit tests including round trips through forward kinematics for both arms and random body orientations.
-  Not tested: a real camera, real hand and pose landmark accuracy.
+- Tested: 62 unit tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
+  with a tilted camera and missing hips, and PnP hand position recovery; the live loop was run headless in all
+  three modes. Not tested here: real camera accuracy. Use the checks above on your own setup.
