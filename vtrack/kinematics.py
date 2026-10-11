@@ -234,3 +234,30 @@ def up_from_neutral(pose: np.ndarray, side: str = "right") -> np.ndarray:
     """
     s_i, e_i, _ = _SIDE[side]
     return unit(pose[s_i] - pose[e_i])
+
+
+# Approximate typical active range of motion, degrees. Readings well outside these usually mean bad tracking.
+TYPICAL_RANGE = {
+    "elbow_flexion": (-10.0, 155.0),
+    "forearm_rotation": (-95.0, 95.0),
+    "wrist_flexion": (-75.0, 85.0),
+    "wrist_deviation": (-40.0, 25.0),
+}
+
+
+def out_of_range(angles: "ArmAngles", margin: float = 10.0) -> list[str]:
+    """Names of angles more than `margin` degrees outside TYPICAL_RANGE (NaN values are skipped)."""
+    bad = []
+    for k, (lo, hi) in TYPICAL_RANGE.items():
+        v = getattr(angles, k)
+        if np.isfinite(v) and (v < lo - margin or v > hi + margin):
+            bad.append(k)
+    return bad
+
+
+def arm_visible(visibility, side: str = "right", thresh: float = 0.6) -> list[str]:
+    """Which of shoulder, elbow, wrist are NOT confidently visible (MediaPipe pose visibility)."""
+    if visibility is None:
+        return ["shoulder", "elbow", "wrist"]
+    s_i, e_i, w_i = _SIDE[side]
+    return [n for n, i in (("shoulder", s_i), ("elbow", e_i), ("wrist", w_i)) if visibility[i] < thresh]

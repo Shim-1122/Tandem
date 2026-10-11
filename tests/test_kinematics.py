@@ -218,3 +218,19 @@ def test_up_hint_replaces_hips_when_they_are_wrong():
     assert abs(wrong.shoulder_flexion - good.shoulder_flexion) > 10
     for k in KEYS:
         assert getattr(fixed, k) == pytest.approx(getattr(good, k), abs=1e-6), k
+
+
+def test_out_of_range_flags_impossible_wrist_values():
+    from vtrack.kinematics import ArmAngles, out_of_range
+    a = ArmAngles(elbow_flexion=90, forearm_rotation=-30, wrist_flexion=-38, wrist_deviation=60.7)
+    assert out_of_range(a) == ["wrist_deviation"]
+    assert out_of_range(ArmAngles()) == []
+
+
+def test_arm_visible_reports_missing_joints():
+    from vtrack.kinematics import arm_visible
+    vis = np.ones(33)
+    vis[R_ELBOW] = 0.2
+    assert arm_visible(vis, "right") == ["elbow"]
+    assert arm_visible(vis, "left") == []
+    assert arm_visible(None) == ["shoulder", "elbow", "wrist"]

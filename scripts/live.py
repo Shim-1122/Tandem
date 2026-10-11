@@ -31,7 +31,7 @@ from vtrack import (ArmKinematics, Gesture, GestureDebouncer, LandmarkSmoother, 
 from vtrack.draw import (CYAN, HAND_EDGES, POSE_ARM_EDGES, YELLOW, draw_wireframe, render_arm_panel,
                          render_hand_panel, text_block)
 from vtrack.handpose import HandPoseZero, all_finger_angles, camera_matrix, hand_frame, hand_pose_camera
-from vtrack.kinematics import ArmAngles, thorax_frame, up_from_neutral
+from vtrack.kinematics import ArmAngles, arm_visible, out_of_range, thorax_frame, up_from_neutral
 from vtrack.tracker import Tracker, pick_hand
 
 ANGLE_FIELDS = ["shoulder_flexion", "shoulder_abduction", "shoulder_rotation", "elbow_flexion",
@@ -127,12 +127,14 @@ def main():
             hand = pick_hand(res, a.side)
             hand_w = hand_smooth(hand.world, t) if hand is not None else None
             if hand_w is not None:
-                debounce.update(classify_hand(hand_w))
-                gesture = debounce.current.value
+                g = classify_hand(hand_w)
+                debounce.update(g)
+                gesture = debounce.current.value if g == debounce.current else "unknown"
             if res.pose_world is not None:
                 pose_w = pose_smooth(res.pose_world, t)
                 vis = res.pose_visibility
                 hips_seen = vis is not None and min(vis[23], vis[24]) > 0.5
+                missing = arm_visible(vis, a.side)
                 if want_zero:
                     up_cal = up_from_neutral(pose_w, a.side)
                     kin.reset()
@@ -144,7 +146,10 @@ def main():
                     up_hint, torso_src = up_cal, "calibrated"
                 else:
                     up_hint, torso_src = np.array([0.0, -1.0, 0.0]), "camera vertical"
-                ang = kin.solve(pose_w, None if a.pose_only_wrist else hand_w, up_hint)
+                if missing:
+                    ang = ArmAngles()          # do not show angles built on guessed landmarks
+                else:
+                    ang = kin.solve(pose_w, None if a.pose_only_wrist else hand_w, up_hint)
                 if want_check:
                     fwd = thorax_frame(pose_w, up_hint)[0][:, 0]
                     print(f"torso up from: {torso_src}; forward in camera axes: {np.round(fwd, 2)} "
@@ -154,8 +159,13 @@ def main():
                                                    frame_agreement_deg(pose_w, hand_w, a.side).items()},
                               "(hand_vs_forearm under ~20 with a straight wrist is good)")
                     want_check = False
-                for k in ANGLE_FIELDS:
+                if missing:
+                    lines.append(f"{', '.join(missing)} not in view: move back so the whole {a.side} arm is visible")
+                bad = set(out_of_range(ang))
+                for k in ANGLE_FIELDS if not missing else []:
                     v, mark = getattr(ang, k), ""
+                    if k in bad:
+                        mark = " (outside normal range: check tracking)"
                     if k == "shoulder_rotation" and not ang.shoulder_rotation_valid:
                         mark = " (held)"
                     if k in ("forearm_rotation", "wrist_flexion", "wrist_deviation") and not ang.wrist_valid:
@@ -166,7 +176,12 @@ def main():
             else:
                 lines.append("no body detected: shoulders and tracked arm must be in view")
             lines.append(f"gesture: {gesture}")
-            note = "" if ang.shoulder_rotation_valid else "shoulder rotation held (elbow straight or arm out sideways)"
+            if res.pose_world is not None and missing:
+                note = "arm not fully visible: no angles"
+            elif not ang.shoulder_rotation_valid and np.isfinite(ang.shoulder_flexion):
+                note = "shoulder rotation held (elbow straight or arm out sideways)"
+            else:
+                note = ""
             panel = render_arm_panel(ang, a.side, size=480, note=note)
             if writer:
                 writer.writerow([f"{t:.3f}", gesture, *[round(getattr(ang, k), 2) for k in ANGLE_FIELDS],
@@ -178,8 +193,9 @@ def main():
             world = hand_smooth(hand.world, t) if hand is not None else None
             row = None
             if world is not None:
-                debounce.update(classify_hand(world))
-                gesture = debounce.current.value
+                g = classify_hand(world)
+                debounce.update(g)
+                gesture = debounce.current.value if g == debounce.current else "unknown"
                 R, tvec = hand_pose_camera(hand.world, hand.image, K)
                 if R is not None:
                     R_hand = R @ hand_frame(world)
