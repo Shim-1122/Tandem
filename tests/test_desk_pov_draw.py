@@ -116,3 +116,43 @@ def test_panels_render_with_and_without_data():
     d = render_hand_panel(None, size=240)
     for img in (a, b, c, d):
         assert img.shape == (240, 240, 3) and img.any()
+
+
+def test_desk_calibration_with_both_arms_hanging():
+    body = rot_x(np.radians(20)) @ CAM
+    pr, _ = forward_arm(NEUTRAL, "right", body_rotation=body)
+    pl, _ = forward_arm(NEUTRAL, "left", body_rotation=body)
+    pose = pr.copy()
+    for i in (13, 15, 17, 19):
+        pose[i] = pl[i]
+    up = up_from_neutral(pose, "both")
+    assert up == pytest.approx(body @ np.array([0.0, 1.0, 0.0]), abs=1e-9)
+
+
+def test_both_arms_solved_independently_from_one_pose():
+    from vtrack.geometry import L_ELBOW, L_WRIST
+    right = dict(shoulder_flexion=40, shoulder_abduction=20, shoulder_rotation=30, elbow_flexion=80,
+                 forearm_rotation=20, wrist_flexion=15, wrist_deviation=5)
+    left = dict(shoulder_flexion=10, shoulder_abduction=45, shoulder_rotation=-20, elbow_flexion=110,
+                forearm_rotation=-40, wrist_flexion=-10, wrist_deviation=-15)
+    pr, hr = forward_arm(right, "right", body_rotation=CAM)
+    pl, hl = forward_arm(left, "left", body_rotation=CAM)
+    pose = pr.copy()
+    for i in (L_ELBOW, L_WRIST, 17, 19):
+        pose[i] = pl[i]
+    out_r = ArmKinematics("right").solve(pose, hr)
+    out_l = ArmKinematics("left").solve(pose, hl)
+    for k in KEYS:
+        assert getattr(out_r, k) == pytest.approx(right[k], abs=1e-6)
+        assert getattr(out_l, k) == pytest.approx(left[k], abs=1e-6)
+
+
+def test_two_arm_panel_and_column_text_render():
+    pytest.importorskip("cv2")
+    from vtrack.draw import render_arms_panel, text_block
+    from vtrack.kinematics import ArmAngles
+    img = render_arms_panel({"left": dict(NEUTRAL), "right": ArmAngles()}, size=240)
+    assert img.shape == (240, 240, 3) and img.any()
+    canvas = np.zeros((200, 600, 3), np.uint8)
+    text_block(canvas, ["\tLEFT\tRIGHT", "Elbow flexion\t110.0\t80.0", "torso up: calibrated"])
+    assert canvas.any()

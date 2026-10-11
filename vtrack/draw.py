@@ -57,60 +57,76 @@ def _project(points, view, center, scale, horiz_axis=2, vert_axis=1, vert_sign=-
     return [(int(center[0] + scale * p[horiz_axis]), int(center[1] + vert_sign * scale * p[vert_axis])) for p in q]
 
 
-def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-20.0, note=""):
-    """3D view of torso and arm rebuilt from solved angles (an ArmAngles or dict). Returns a BGR image.
+ARM_COLORS = {"right": CYAN, "left": (255, 140, 255)}   # BGR: cyan right, pink left
+KEYS = ["shoulder_flexion", "shoulder_abduction", "shoulder_rotation", "elbow_flexion",
+        "forearm_rotation", "wrist_flexion", "wrist_deviation"]
 
+
+def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-20.0, note=""):
+    """3D view of the torso and one arm rebuilt from solved angles. See `render_arms_panel`."""
+    return render_arms_panel({side: angles}, size, yaw_deg, pitch_deg, note)
+
+
+def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note=""):
+    """3D view of the torso and arms rebuilt from solved angles. Returns a BGR image.
+
+    angles_by_side: {"right": ArmAngles or dict, "left": ...}; either side may be omitted or all NaN.
     Drawn as a mirror view (your right arm on the right), matching the mirrored video. Small
-    red/green/blue axes show each segment's frame: upper arm at the elbow, forearm and hand at the wrist.
+    red/green/blue axes show each segment's frame: upper arm at the elbow, forearm at the wrist,
+    hand at the knuckles.
     """
     cv2 = _cv2()
     img = np.full((size, size, 3), 25, np.uint8)
-    get = (lambda k: angles[k]) if isinstance(angles, dict) else (lambda k: getattr(angles, k))
-    keys = ["shoulder_flexion", "shoulder_abduction", "shoulder_rotation", "elbow_flexion",
-            "forearm_rotation", "wrist_flexion", "wrist_deviation"]
-    vals = {k: get(k) for k in keys}
-    if any(not np.isfinite(vals[k]) for k in keys[:4]):
-        cv2.putText(img, "no arm pose", (20, size // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
-        return img
-    wrist_ok = all(np.isfinite(vals[k]) for k in keys[4:])
-    for k in keys[4:]:
-        if not np.isfinite(vals[k]):
-            vals[k] = 0.0
-    c = arm_chain(vals)
-    mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
-    P = {k: c[k] * mirror for k in ("S", "E", "W", "K", "index", "pinky")}
-    torso = {"rs": np.array([0, 0, 0.2]), "ls": np.array([0, 0, -0.2]),
-             "rh": np.array([0, -0.5, 0.1]), "lh": np.array([0, -0.5, -0.1])}
     view = _view(yaw_deg, pitch_deg, "z")
     center, scale = (size // 2, int(size * 0.30)), size * 0.75
 
     def pr(*pts):
         return _project(pts, view, center, scale)
 
-    # floor grid for depth cues
-    for g in np.linspace(-0.4, 0.4, 5):
+    for g in np.linspace(-0.4, 0.4, 5):                 # floor grid for depth cues
         a, b = pr(np.array([g, -0.5, -0.4]), np.array([g, -0.5, 0.4]))
         cv2.line(img, a, b, (45, 45, 45), 1)
         a, b = pr(np.array([-0.4, -0.5, g]), np.array([0.4, -0.5, g]))
         cv2.line(img, a, b, (45, 45, 45), 1)
-    rs, ls, rh, lh = pr(torso["rs"], torso["ls"], torso["rh"], torso["lh"])
+    rs, ls, rh, lh = pr(np.array([0, 0, 0.2]), np.array([0, 0, -0.2]),
+                        np.array([0, -0.5, 0.1]), np.array([0, -0.5, -0.1]))
     for a, b in ((rs, ls), (rs, rh), (ls, lh), (rh, lh)):
         cv2.line(img, a, b, GREY, 2, cv2.LINE_AA)
-    s, e, w, k, ix, pk = pr(P["S"], P["E"], P["W"], P["K"], P["index"], P["pinky"])
-    cv2.line(img, s, e, CYAN, 4, cv2.LINE_AA)
-    cv2.line(img, e, w, CYAN, 4, cv2.LINE_AA)
-    hand_col = YELLOW if wrist_ok else GREY
-    for a, b in ((w, ix), (w, pk), (ix, pk), (w, k)):
-        cv2.line(img, a, b, hand_col, 2, cv2.LINE_AA)
-    for p in (s, e, w):
-        cv2.circle(img, p, 6, WHITE, -1, cv2.LINE_AA)
-    # segment frames
-    L = 0.08
-    for origin, R in ((P["E"], c["R_h"]), (P["W"], c["R_f"]), (P["K"], c["R_hand"])):
-        R = R * mirror[:, None]
-        for i in range(3):
-            a, b = pr(origin, origin + L * R[:, i])
-            cv2.arrowedLine(img, a, b, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
+    cv2.putText(img, "R", (rs[0] + 8, rs[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ARM_COLORS["right"], 2)
+    cv2.putText(img, "L", (ls[0] - 22, ls[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ARM_COLORS["left"], 2)
+
+    drawn = 0
+    for side, angles in angles_by_side.items():
+        if angles is None:
+            continue
+        get = (lambda k: angles[k]) if isinstance(angles, dict) else (lambda k: getattr(angles, k))
+        vals = {k: get(k) for k in KEYS}
+        if any(not np.isfinite(vals[k]) for k in KEYS[:4]):
+            continue
+        drawn += 1
+        wrist_ok = all(np.isfinite(vals[k]) for k in KEYS[4:])
+        for k in KEYS[4:]:
+            if not np.isfinite(vals[k]):
+                vals[k] = 0.0
+        c = arm_chain(vals)
+        mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
+        P = {k: c[k] * mirror for k in ("S", "E", "W", "K", "index", "pinky")}
+        s, e, w, k, ix, pk = pr(P["S"], P["E"], P["W"], P["K"], P["index"], P["pinky"])
+        col = ARM_COLORS[side]
+        cv2.line(img, s, e, col, 4, cv2.LINE_AA)
+        cv2.line(img, e, w, col, 4, cv2.LINE_AA)
+        hand_col = YELLOW if wrist_ok else GREY
+        for a, b in ((w, ix), (w, pk), (ix, pk), (w, k)):
+            cv2.line(img, a, b, hand_col, 2, cv2.LINE_AA)
+        for p in (s, e, w):
+            cv2.circle(img, p, 6, WHITE, -1, cv2.LINE_AA)
+        for origin, R in ((P["E"], c["R_h"]), (P["W"], c["R_f"]), (P["K"], c["R_hand"])):
+            R = R * mirror[:, None]
+            for i in range(3):
+                a, b = pr(origin, origin + 0.08 * R[:, i])
+                cv2.arrowedLine(img, a, b, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
+    if drawn == 0:
+        cv2.putText(img, "no arm pose", (20, size // 2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
     cv2.putText(img, "solved kinematics (mirror view)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
     if note:
         cv2.putText(img, note, (10, size - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, YELLOW, 1)
@@ -138,12 +154,29 @@ def render_hand_panel(world, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note=""):
 
 
 def text_block(img, lines, scale=None, color=GREEN):
-    """Draw lines of text on a dark box in the top-left corner, in place."""
+    """Draw lines of text on a dark box in the top-left corner, in place.
+
+    A line containing tab characters is drawn as columns: the first cell left aligned, later cells
+    right aligned at fixed positions, so numbers line up even with OpenCV's proportional font.
+    """
     cv2 = _cv2()
+    font = cv2.FONT_HERSHEY_SIMPLEX
     scale = scale or max(0.5, img.shape[1] / 1280 * 0.8)
     step = int(30 * scale)
-    width = max([cv2.getTextSize(t, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)[0][0] for t in lines] + [10])
-    cv2.rectangle(img, (0, 0), (width + 20, step * len(lines) + 12), (0, 0, 0), -1)
-    for i, t in enumerate(lines):
-        cv2.putText(img, t, (10, step * (i + 1)), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+
+    def width(t):
+        return cv2.getTextSize(t, font, scale, 2)[0][0]
+
+    cells = [ln.split("\t") for ln in lines]
+    first_w = max([width(c[0]) for c in cells if len(c) > 1] + [0])
+    col_w = max([width(x) for c in cells if len(c) > 1 for x in c[1:]] + [0]) + int(18 * scale)
+    ncols = max(len(c) for c in cells)
+    total = max([width(c[0]) for c in cells if len(c) == 1] + [first_w + col_w * (ncols - 1)] + [10])
+    cv2.rectangle(img, (0, 0), (total + 20, step * len(lines) + 12), (0, 0, 0), -1)
+    for i, c in enumerate(cells):
+        y = step * (i + 1)
+        cv2.putText(img, c[0], (10, y), font, scale, color, 2, cv2.LINE_AA)
+        for j, x in enumerate(c[1:], start=1):
+            right = 10 + first_w + col_w * j
+            cv2.putText(img, x, (right - width(x), y), font, scale, color, 2, cv2.LINE_AA)
     return img

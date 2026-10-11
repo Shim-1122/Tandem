@@ -231,9 +231,10 @@ def up_from_neutral(pose: np.ndarray, side: str = "right") -> np.ndarray:
     For desk use with the hips out of view: sit upright, let the tracked upper arm hang vertically
     beside the torso (elbow bent 90 degrees, forearm forward, thumb up), and capture this once. Pass the
     result as `up_hint` to `ArmKinematics.solve`. It assumes the camera and your torso stay put afterwards.
+    side="both" averages both upper arms (both hanging), which cancels small left/right differences.
     """
-    s_i, e_i, _ = _SIDE[side]
-    return unit(pose[s_i] - pose[e_i])
+    sides = ["left", "right"] if side == "both" else [side]
+    return unit(sum(unit(pose[_SIDE[sd][0]] - pose[_SIDE[sd][1]]) for sd in sides))
 
 
 # Approximate typical active range of motion, degrees. Readings well outside these usually mean bad tracking.

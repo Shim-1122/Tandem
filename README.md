@@ -26,6 +26,7 @@ pip install -r requirements.txt
 python -m pytest                                        # no camera needed
 python scripts/live.py --side right                     # standing, hips in view
 python scripts/live.py --side right --torso desk        # seated at a desk, hips hidden
+python scripts/live.py --side both --torso desk         # both arms at once
 python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
 ```
 
@@ -38,6 +39,14 @@ kinematics, with red/green/blue axes for the upper arm, forearm and hand frames.
 believes, so if it moves like your arm the kinematics are right, and if it disagrees with the video the
 angles are wrong.
 
+With `--side both`, each arm has its own solver and hand, the readout shows LEFT and RIGHT columns, the
+3D panel draws both arms (cyan right, pink left), and a recording gets `L_` and `R_` columns. Both arms
+share one torso frame, so they must both be in view with the shoulders.
+
+The tracker only shows an arm's angles when its shoulder, elbow and wrist are actually visible; otherwise it
+says which joint is out of view, because MediaPipe still reports a guessed position for hidden joints.
+Angles far outside a normal human range are flagged as a tracking problem.
+
 Keys (click the video window first): `q` quit, `w` toggle wireframe, `c` print checks to the terminal,
 `z` calibrate (see below).
 
@@ -48,7 +57,7 @@ and torso in view, hips included. Torso "up" comes from shoulders and hips.
 
 **Desk (`--torso desk`).** No hips needed. Shoulders and the tracked arm must be in view. Sit upright, let the
 tracked upper arm hang straight down beside your torso with the elbow bent 90 degrees, forearm forward and
-thumb up, and press `z`. That pose becomes zero, and the calibration removes the camera's tilt (a laptop
+thumb up (with `--side both`, both arms like that), and press `z`. That pose becomes zero, and the calibration removes the camera's tilt (a laptop
 screen leaned back 25 degrees would otherwise add 25 degrees of shoulder flexion). Press `z` again whenever
 you move the camera or your chair. If the upper arm is not hanging straight down when you press `z`, every
 flexion reading is offset by that amount. Before calibrating, the camera's vertical is used, so keep the
@@ -117,6 +126,6 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - One RGB camera gives estimated depth, so angles are most reliable when the arm moves across the camera view.
 - The command mapping stops at 0..1 per joint. Mapping to air muscle pressure needs a calibration curve per muscle.
 - The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once its axes are decided.
-- Tested: 62 unit tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
+- Tested: 67 unit tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
   with a tilted camera and missing hips, and PnP hand position recovery; the live loop was run headless in all
   three modes. Not tested here: real camera accuracy. Use the checks above on your own setup.
