@@ -1,0 +1,246 @@
+"""Face recognition and emotion tracking.
+
+Emotion follows the same approach as the reference project (atulapra/Emotion-detection: detect the face,
+crop it, classify it with a neural network trained on facial expressions) but with OpenCV Zoo's
+published models, which run on OpenCV alone (no TensorFlow):
+  * face detection and 5 landmarks: YuNet (face_detection_yunet_2023mar)
+  * emotion: Progressive Teacher on a MobileFaceNet backbone (facial_expression_recognition_mobilefacenet_
+    2022july), 88.3% accuracy on RAF-DB (the reference project's CNN reports 63.2% on FER-2013). It scores
+    seven classes: the six cardinal (Ekman) emotions plus neutral. Scores are turned into percentages with
+    softmax; the six emotions and neutral together add up to 100%.
+  * recognition: SFace (face_recognition_sface_2021dec), 99.4% on LFW. Faces are matched to people you
+    enroll (press e) by cosine similarity; 0.363 or more counts as the same person (OpenCV's threshold).
+All three are Apache 2.0 licensed and download on first use from OpenCV's Hugging Face pages. Enrolled
+faces are stored only on this computer, in the faces/ folder (128 numbers per sample, no images).
+"""
+from __future__ import annotations
+
+import math
+import ssl
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+HF = "https://huggingface.co/opencv"
+FACE_MODELS = {
+    "yunet": f"{HF}/face_detection_yunet/resolve/main/face_detection_yunet_2023mar.onnx",
+    "fer": f"{HF}/facial_expression_recognition/resolve/main/facial_expression_recognition_mobilefacenet_2022july.onnx",
+    "sface": f"{HF}/face_recognition_sface/resolve/main/face_recognition_sface_2021dec.onnx",
+}
+# Model output order
+EMOTIONS = ["angry", "disgust", "fearful", "happy", "neutral", "sad", "surprised"]
+# The six cardinal emotions, in display order, with display names
+CARDINAL = [("happy", "Happiness"), ("sad", "Sadness"), ("angry", "Anger"), ("fearful", "Fear"),
+            ("surprised", "Surprise"), ("disgust", "Disgust")]
+SAME_PERSON_COSINE = 0.363
+# FER alignment template (112 x 112): right eye, left eye, nose tip, right and left mouth corners
+FER_TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+                         [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float64)
+
+
+def ssl_context() -> ssl.SSLContext:
+    """Uses certifi when installed; Python from python.org on macOS lacks the system certificates."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def download(url: str, path: Path) -> Path:
+    path = Path(path)
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Downloading {path.name} ...")
+        tmp = path.with_suffix(path.suffix + ".part")
+        with urllib.request.urlopen(url, context=ssl_context()) as r, open(tmp, "wb") as f:
+            f.write(r.read())
+        tmp.replace(path)
+    return path
+
+
+def softmax(z: np.ndarray) -> np.ndarray:
+    z = np.asarray(z, dtype=np.float64)
+    e = np.exp(z - z.max())
+    return e / e.sum()
+
+
+def similarity_transform(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+    """2x3 non-reflective similarity (rotation, uniform scale, shift) mapping src points onto dst.
+
+    As in the OpenCV Zoo emotion demo's FaceAlignment (same result): the dst-to-src similarity is fitted
+    by least squares, then inverted.
+    """
+    src, dst = np.asarray(src, np.float64), np.asarray(dst, np.float64)
+    n = len(src)
+    A = np.zeros((2 * n, 4))
+    A[:n] = np.column_stack([dst[:, 0], dst[:, 1], np.ones(n), np.zeros(n)])
+    A[n:] = np.column_stack([dst[:, 1], -dst[:, 0], np.zeros(n), np.ones(n)])
+    b = np.concatenate([src[:, 0], src[:, 1]])
+    sc, ss, tx, ty = np.linalg.lstsq(A, b, rcond=-1)[0]
+    Tinv = np.array([[sc, -ss, 0.0], [ss, sc, 0.0], [tx, ty, 1.0]])   # maps dst -> src
+    T = np.linalg.inv(Tinv)
+    T[:, 2] = [0.0, 0.0, 1.0]
+    return T[:, :2].T
+
+
+@dataclass
+class FaceDetection:
+    box: np.ndarray            # x, y, w, h in pixels
+    landmarks5: np.ndarray     # (5, 2): right eye, left eye, nose tip, right and left mouth corners
+    score: float
+    row: np.ndarray = field(repr=False, default=None)   # the raw YuNet row, for SFace alignment
+
+
+class FaceDetector:
+    """YuNet. Runs on a frame scaled so its width is at most `max_width` (faster), returns full-size pixels."""
+
+    def __init__(self, model_dir="models", max_width=640, score_thresh=0.7):
+        import cv2
+        path = download(FACE_MODELS["yunet"], Path(model_dir) / "face_detection_yunet_2023mar.onnx")
+        self.det = cv2.FaceDetectorYN.create(str(path), "", (320, 320), score_thresh, 0.3, 5000)
+        self.max_width = max_width
+
+    def detect(self, bgr: np.ndarray) -> list[FaceDetection]:
+        import cv2
+        h, w = bgr.shape[:2]
+        s = min(1.0, self.max_width / w)
+        img = cv2.resize(bgr, (int(round(w * s)), int(round(h * s)))) if s < 1.0 else bgr
+        self.det.setInputSize((img.shape[1], img.shape[0]))
+        _, faces = self.det.detect(img)
+        out = []
+        for f in ([] if faces is None else faces):
+            row = f.copy()
+            row[:14] /= s
+            out.append(FaceDetection(row[:4].copy(), row[4:14].reshape(5, 2).copy(), float(row[14]), row))
+        return sorted(out, key=lambda d: -d.box[2] * d.box[3])           # largest face first
+
+
+class EmotionModel:
+    def __init__(self, model_dir="models"):
+        import cv2
+        path = download(FACE_MODELS["fer"], Path(model_dir) / "facial_expression_recognition_mobilefacenet_2022july.onnx")
+        self.net = cv2.dnn.readNet(str(path))
+
+    def aligned(self, bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
+        import cv2
+        return cv2.warpAffine(bgr, similarity_transform(landmarks5, FER_TEMPLATE), (112, 112))
+
+    def probabilities(self, bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
+        """Seven probabilities in EMOTIONS order (sum 1)."""
+        import cv2
+        img = cv2.cvtColor(self.aligned(bgr, landmarks5), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        img = (img - 0.5) / 0.5
+        self.net.setInput(cv2.dnn.blobFromImage(img), "data")
+        return softmax(self.net.forward("label").reshape(-1))
+
+
+class FaceRecognizer:
+    """SFace embeddings and a small gallery of enrolled people stored in `faces_dir`."""
+
+    def __init__(self, model_dir="models", faces_dir="faces"):
+        import cv2
+        path = download(FACE_MODELS["sface"], Path(model_dir) / "face_recognition_sface_2021dec.onnx")
+        self.rec = cv2.FaceRecognizerSF.create(str(path), "")
+        self.faces_dir = Path(faces_dir)
+        self.gallery: dict[str, np.ndarray] = {}
+        if self.faces_dir.exists():
+            for f in sorted(self.faces_dir.glob("*.npy")):
+                self.gallery[f.stem] = np.load(f)
+
+    def embedding(self, bgr: np.ndarray, det: FaceDetection) -> np.ndarray:
+        crop = self.rec.alignCrop(bgr, det.row.reshape(1, -1).astype(np.float32))
+        v = self.rec.feature(crop).reshape(-1).astype(np.float64)
+        return v / max(np.linalg.norm(v), 1e-12)
+
+    def enroll(self, name: str, emb: np.ndarray) -> int:
+        """Add one sample for `name` and save it; returns the number of samples for that person."""
+        samples = np.vstack([self.gallery[name], emb]) if name in self.gallery else emb[None, :]
+        self.gallery[name] = samples
+        self.faces_dir.mkdir(parents=True, exist_ok=True)
+        np.save(self.faces_dir / f"{name}.npy", samples)
+        return len(samples)
+
+    def identify(self, emb: np.ndarray) -> tuple[str | None, float]:
+        """(name, cosine similarity) of the best match, name None when below the same-person threshold."""
+        best, score = None, -1.0
+        for name, samples in self.gallery.items():
+            s = float(np.max(samples @ emb))
+            if s > score:
+                best, score = name, s
+        return (best if score >= SAME_PERSON_COSINE else None), score
+
+
+class EmotionSmoother:
+    """Exponential smoothing of the probability vector with time constant `tau_s` (frame-rate independent)."""
+
+    def __init__(self, tau_s: float = 0.35):
+        self.tau, self.p, self.t = tau_s, None, None
+
+    def __call__(self, p: np.ndarray, t: float) -> np.ndarray:
+        p = np.asarray(p, dtype=np.float64)
+        if self.p is None or t <= self.t:
+            self.p = p.copy()
+        else:
+            a = 1.0 - math.exp(-(t - self.t) / self.tau)
+            self.p = self.p + a * (p - self.p)
+        self.t = t
+        return self.p.copy()
+
+    def reset(self):
+        self.p = self.t = None
+
+
+def cardinal_percentages(emotions: dict) -> list[tuple[str, float]]:
+    """[(display name, percent)] for the six cardinal emotions, highest first."""
+    return sorted(((label, 100.0 * emotions[key]) for key, label in CARDINAL), key=lambda kv: -kv[1])
+
+
+class EmotionTask:
+    """Worker function for the live app: face detection, emotion and, once someone is enrolled, recognition.
+
+    Called with a frame (attributes t and bgr); returns None without a face, else a dict with the face box,
+    the seven emotion probabilities, the recognized name (or None) and its match score. Recognition runs at
+    most every `recognize_every_s` seconds; set `enroll_request` to a name to add the current face.
+    """
+
+    def __init__(self, model_dir: str, faces_dir: str, recognize_every_s: float = 0.5):
+        self.model_dir, self.faces_dir = model_dir, faces_dir
+        self.detector, self.emotion = FaceDetector(model_dir), EmotionModel(model_dir)
+        self.recognizer = None
+        if Path(faces_dir).exists() and any(Path(faces_dir).glob("*.npy")):
+            self._load_recognizer()
+        self.every = recognize_every_s
+        self._last_id = (None, -1.0, -1e9)
+        self.enroll_request: str | None = None
+        self.message = ""
+
+    def _load_recognizer(self):
+        self.recognizer = FaceRecognizer(self.model_dir, self.faces_dir)
+
+    def __call__(self, frame):
+        dets = self.detector.detect(frame.bgr)
+        if not dets:
+            self._last_id = (None, -1.0, -1e9)        # a new face is identified from scratch
+            return None
+        d = dets[0]
+        probs = self.emotion.probabilities(frame.bgr, d.landmarks5)
+        name, score, t_id = self._last_id
+        if self.enroll_request:
+            who, self.enroll_request = self.enroll_request, None
+            try:
+                if self.recognizer is None:
+                    self._load_recognizer()              # downloads the recognition model on first use
+                n = self.recognizer.enroll(who, self.recognizer.embedding(frame.bgr, d))
+                self.message = f"enrolled {who} ({n} sample{'s' if n > 1 else ''})"
+            except Exception as exc:
+                self.message = f"enrolling failed: {type(exc).__name__}: {exc}"[:120]
+            t_id = -1e9
+        if self.recognizer is not None and self.recognizer.gallery and frame.t - t_id >= self.every:
+            name, score = self.recognizer.identify(self.recognizer.embedding(frame.bgr, d))
+            t_id = frame.t
+            self._last_id = (name, score, t_id)
+        return dict(box=d.box, probs=probs, identity=name, match=score,
+                    enrolled=bool(self.recognizer and self.recognizer.gallery))

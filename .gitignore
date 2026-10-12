@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 .venv/
-models/*.task
+models/
+faces/
 recordings/
 .pytest_cache/
