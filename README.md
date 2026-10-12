@@ -1,14 +1,18 @@
 # Homunculus Shadowing
 
-Camera-based arm and hand joint tracking so the Homunculus pneumatic arm can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles plus hand gestures from a single webcam.
+Camera-based arm and hand joint tracking so the Homunculus pneumatic arm can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, plus the head's 6 degrees of freedom, face recognition and emotion, from a single webcam.
 
-Pipeline: camera frame -> MediaPipe hand and pose landmarks (3D, meters) -> One Euro smoothing -> joint angles and gestures -> normalized 0..1 joint commands with limits and slew-rate control.
+Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
 
 ## What is here
 
 | Module | Purpose |
 | --- | --- |
-| `vtrack/tracker.py` | MediaPipe Tasks wrapper (hand + pose, VIDEO mode), model download, hand-to-arm matching by position |
+| `vtrack/app.py` | The live application: runs the models in threads, combines their results, draws the screen, records CSV |
+| `vtrack/pipeline.py` | Low-latency capture and model threads (newest frame only), CPU priority for hands, rate and latency meters |
+| `vtrack/tracker.py` | MediaPipe Tasks wrappers (hand, pose, face mesh; VIDEO mode), model download, hand-to-arm matching by position |
+| `vtrack/head.py` | Head pose with 6 DOF (position and yaw, pitch, roll) from 4 anchor points on the face |
+| `vtrack/face.py` | Face detection, emotion (six cardinal emotions plus neutral, in percent) and face recognition |
 | `vtrack/kinematics.py` | Seven joint angles per arm: shoulder 3 DOF, elbow 1 DOF, wrist 3 DOF, with validity flags |
 | `vtrack/synthetic.py` | Forward kinematics (angles to landmarks and segment frames) for tests, the 3D panel, and a simulated arm |
 | `vtrack/draw.py` | Landmark wireframes and the 3D panels (arm rebuilt from solved angles, or the hand in POV mode) |
@@ -17,9 +21,9 @@ Pipeline: camera frame -> MediaPipe hand and pose landmarks (3D, meters) -> One 
 | `vtrack/handpose.py` | POV mode: hand position and orientation relative to the camera (PnP), zeroing |
 | `vtrack/geometry.py` | Lower level angle math: finger flexion, torso frame |
 | `vtrack/filters.py` | One Euro landmark and joint-angle smoothing, smoothing presets, jitter meter |
-| `vtrack/gestures.py` | Rule-based gestures (open palm, fist, point, peace, thumbs up) and a debouncer |
+| `vtrack/gestures.py` | 16 rule-based hand gestures and a time-based filter that removes flicker |
 | `vtrack/mapping.py` | Angle to 0..1 command mapping and a slew-rate limiter |
-| `scripts/live.py` | Live demo: wireframe on the video, 3D kinematics panel, angles, CSV recording |
+| `scripts/live.py` | Starts the live app from the command line (options listed with `--help`) |
 | `scripts/eval_stability.py` | Jitter and lag of each smoothing preset on simulated noisy landmarks |
 
 ## Run
@@ -31,16 +35,25 @@ python scripts/live.py --side right                     # standing, hips in view
 python scripts/live.py --side right --torso desk        # seated at a desk, hips hidden
 python scripts/live.py --side both --torso desk         # both arms at once
 python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
+python scripts/live.py --name shyam                     # then press e to enroll your face as shyam
 ```
 
-Add `--record recordings/run1.csv` to any of these to save every frame. Models (about 8 MB hand, 6 MB
-pose lite) download into `models/` on first run.
+Add `--record recordings/run1.csv` to any of these to save every update. Models download into `models/` on
+first run: hand 8 MB, pose 9 MB (full), face mesh 4 MB, face detector 0.2 MB, emotion 5 MB, and the face
+recognition model (38 MB) only when you first enroll your face. On slower computers add `--no-emotion` or
+`--no-face` (see Latency).
 
-The window shows the video with the landmark wireframe (cyan body, yellow hands) on the left and a 3D
-panel on the right. In body mode the panel rebuilds your arm from the solved joint angles through forward
-kinematics, with red/green/blue axes for the upper arm, forearm and hand frames. It shows what the solver
-believes, so if it moves like your arm the kinematics are right, and if it disagrees with the video the
-angles are wrong.
+The window has three parts:
+- **Left: the video** (mirrored in body mode, like a mirror) with the landmark wireframe (cyan body, yellow
+  hands), the head's four anchor points and its axes (red forward, green up, blue right), and a compact
+  readout in the top left corner: joint angles, gestures, and a status line with each model's rate and latency.
+- **Top right: the face panel.** Your face, who it is (after you enroll), the six cardinal emotions with
+  percentages, and the head's 6 DOF (position and yaw, pitch, roll, plus motion since you zeroed it with `h`).
+- **Bottom right: the 3D panel.** In body mode it rebuilds your arms from the solved joint angles through
+  forward kinematics, with red/green/blue axes for the upper arm, forearm and hand frames, the fingers from
+  their solved joint angles, and the head turned relative to the torso (the neck). It shows what the solver
+  believes, so if it moves like you the kinematics are right, and if it disagrees with the video the angles
+  are wrong. In POV mode it shows the hand.
 
 With `--side both`, each arm has its own solver and hand, the readout shows LEFT and RIGHT columns, the
 3D panel draws both arms (cyan right, pink left), and a recording gets `L_` and `R_` columns. Both arms
@@ -51,8 +64,47 @@ predicted, see Elbow prediction); otherwise it says which joint is out of view, 
 a guessed position for hidden joints.
 Angles far outside a normal human range are flagged as a tracking problem.
 
-Keys (click the video window first): `q` quit, `w` toggle wireframe, `c` print checks (axes, arm lengths,
-hand agreement) to the terminal, `f` cycle the finger table, `z` calibrate (see below).
+Keys (click the video window first):
+
+| Key | Action |
+| --- | --- |
+| `q` | quit |
+| `z` | body mode: calibrate the torso from the neutral pose (see Desk below); POV mode: zero the hand pose |
+| `h` | zero the head pose (the face panel then shows motion since that moment) |
+| `e` | enroll your face for recognition under `--name` (default `me`); press it 3 to 5 times with your head turned slightly differently each time |
+| `f` | cycle the finger joint table (off, then each tracked hand) |
+| `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
+| `w` | toggle the wireframe |
+
+## Latency (smooth hand tracking)
+
+Everything that could make the hands lag has been taken out of the hand's path:
+- **Camera:** a dedicated thread reads the camera continuously and keeps only the newest frame, so a slow
+  moment never leaves you looking at old frames. The camera is asked for 60 fps at 1280x720 (MJPG on Windows
+  and Linux, which many webcams need for 60 fps) with a one-frame buffer. The status line shows what the
+  camera really delivers (`cam N fps`).
+- **Models in parallel:** hands, body, face mesh and emotion each run in their own thread on the newest
+  frame. MediaPipe lets threads run at the same time on different processor cores, so the hand model never
+  waits for the body, face or emotion models. (Measured: two models in parallel took 47 ms per frame against
+  84 ms one after the other.)
+- **Hands first:** the hand and body models always run at full speed. The face mesh and emotion models use
+  only the processor cores left over, and on a computer without spare cores they still run at a guaranteed
+  10 Hz (head) and 3 Hz (emotion). They are also capped at 30 Hz and 10 Hz, because faster would not help.
+- **Smoothing that does not lag:** One Euro filters smooth hard when you hold still and almost not at all
+  when you move fast. Gestures use a 0.2 second majority vote that works the same at any frame rate.
+
+The status line reads like `cam 30 fps | hand 30 Hz 35 ms | pose 30 Hz 40 ms | face 30 Hz 25 ms | emotion 10 Hz 30 ms`:
+rate per model and latency from the moment the camera captured the frame to the moment the result was
+ready. On a 2-core test computer (much slower than a typical laptop, with a 30 fps camera) the hand ran at
+about 25 Hz alone and 15 to 18 Hz with all four models. With 4 or more cores the face and emotion models get
+cores of their own and no longer slow the hands.
+
+If the hands are not smooth:
+1. **Light.** In a dim room most webcams lengthen the exposure and drop to 15 fps; check `cam N fps`. Light
+   your hands well.
+2. **Fewer models:** `--no-emotion`, then `--no-face`, then `--pose-model lite`.
+3. **Other programs:** close video calls and browser tabs that use the camera or the processor.
+4. **Smoothing:** `--smoothing responsive` for the least lag.
 
 ## Modes
 
@@ -79,6 +131,89 @@ depth assumes an average-size hand (a bigger hand reads farther away), and becau
 your head, head motion looks like hand motion unless the goggles also report head orientation (an IMU).
 MediaPipe's left/right label assumes a mirrored image; if POV mode follows the wrong hand, add `--swap-hands`.
 
+## Gestures
+
+16 gestures, each hand separately, in both body and POV mode. The hand can face any direction (except
+thumbs up and down, which need the thumb pointing up or down).
+
+| Gesture | Name shown | How to make it |
+| --- | --- | --- |
+| Open palm | `open_palm` | all five fingers out |
+| Fist | `fist` | all fingers and the thumb curled |
+| Point | `point` | index finger only |
+| Peace | `peace` | index and middle out (a V), thumb tucked |
+| Thumbs up | `thumbs_up` | fist with the thumb out, pointing up |
+| Thumbs down | `thumbs_down` | fist with the thumb out, pointing down |
+| OK | `ok` | thumb and index tips touching, the other three fingers out |
+| Pinch | `pinch` | thumb and index tips touching, the other fingers curled |
+| L shape | `l_shape` | thumb and index out (an L, or a finger gun) |
+| Three | `three` | index, middle and ring out, thumb tucked |
+| Three with thumb | `three_thumb` | thumb, index and middle out |
+| Four | `four` | four fingers out, thumb tucked across the palm |
+| Rock | `rock` | index and pinky out, thumb tucked (horns) |
+| I love you | `i_love_you` | thumb, index and pinky out |
+| Call me | `call_me` | thumb and pinky out (shaka) |
+| Pinky | `pinky_up` | pinky only |
+
+Anything else shows `unknown`. A finger counts as out when its tip is farther from the wrist than its middle
+joint and it bends less than 90 degrees in total; these thresholds were set on real hand photos (relaxed open
+hands, fists, pointing, peace and thumbs up), and the test photos of thumbs up, peace, pointing and open hands
+are all classified correctly, mirrored or not. A gesture shows once it has been held for about 0.1 to 0.2
+seconds and stops showing about 0.1 seconds after the hand changes, so it does not flicker.
+
+## Head (6 DOF, 4 anchor points)
+
+The head pose comes from 4 points on the rigid part of the skull, which do not move when you talk, smile or
+open your mouth: **forehead, nose tip, and the outer corners of both eyes** (shown as dots on the video).
+MediaPipe's face mesh gives their 3D positions; the best rigid fit of a standard head model to those 4 points
+gives the rotation, and the camera's field of view gives the position.
+
+| Value | Meaning |
+| --- | --- |
+| `x`, `y`, `z` | head position in cm from the camera: right, down, away (the point inside the head behind the nose) |
+| `yaw` | turning: + toward your left |
+| `pitch` | nodding: + looking up |
+| `roll` | tilting: + top of the head toward your right shoulder |
+
+All three angles are zero when you face the camera squarely and upright. Press `h` to zero the head where it
+is now; the face panel then shows `dx dy dz` and `dyaw dpitch droll` since that moment, which is what a robot
+head would follow. In body mode the 3D panel also turns the head relative to the torso (the neck angles,
+recorded as `neck_yaw`, `neck_pitch`, `neck_roll`).
+
+Accuracy: on synthetic faces the solution is exact (200 random poses, error under 0.001 degrees); on a real
+portrait photo it agrees with MediaPipe's own full-face fit within 2 degrees, and follows 15 and 30 degree
+image rotations within 1 to 2 degrees. Distance assumes an average-size face and depends on `--fov`
+(your camera's horizontal field of view), so relative motion after `h` is more accurate than absolute
+distance. A fit of only the 4 flat image positions was tested and rejected: it read 27 degrees of pitch on a
+person looking straight at the camera.
+
+## Face recognition and emotion
+
+**Emotion.** The same approach as the reference project
+[atulapra/Emotion-detection](https://github.com/atulapra/Emotion-detection) (find the face, crop it, classify
+the expression with a neural network), with a stronger model that needs only OpenCV: OpenCV Zoo's facial
+expression model (MobileFaceNet), 88.3% accurate on the RAF-DB benchmark, where the reference project's
+network reaches 63.2% on FER-2013. The face is found and aligned with OpenCV's YuNet face detector, exactly
+as in the model's reference code (the scores match that code on 42 test faces).
+
+The face panel shows the **six cardinal emotions with percentages: happiness, sadness, anger, fear, surprise
+and disgust**, the strongest in green. The model also scores neutral, shown underneath; the six and neutral
+add up to 100%, so a relaxed face reads mostly neutral instead of inflating whichever emotion is slightly
+ahead. Percentages are smoothed over about a third of a second. Recorded as `emotion_<name>_pct`.
+
+Keep in mind that the model reads facial expressions, not feelings: a polite smile reads as happiness, and
+lighting, glasses or a turned head lower its accuracy.
+
+**Recognition.** Press `e` to enroll your face (run with `--name shyam` to store it under your name; letters,
+digits, `-` and `_`). Each press adds one sample; 3 to 5 presses with your head turned slightly differently
+works best. From then on the panel shows the name and a match score (cosine similarity, OpenCV's SFace model,
+99.4% on the LFW benchmark). A score of 0.363 or more counts as the same person, OpenCV's recommended
+threshold; below that it shows `unknown face`. In tests the same person matched at 0.94 to 0.97 (mirrored,
+darker, smaller), and 22 different people all scored 0.32 or less against them.
+
+Privacy: enrolled faces stay on your computer in `faces/<name>.npy`, 128 numbers per sample and no images.
+Delete that file to remove a person. `faces/` and `models/` are excluded from git.
+
 ## Elbow prediction
 
 When the elbow leaves the frame but the shoulder and wrist are still visible, the elbow is predicted.
@@ -86,7 +221,7 @@ Upper arm and forearm lengths are learned while all three joints are clearly vis
 estimated from shoulder width using average adult proportions), so the elbow must lie on a known circle
 around the shoulder-wrist line. Where on that circle comes from MediaPipe's own guess for the hidden elbow,
 continuity with the previous frame, and, only as a tie-breaker, the elbow hanging low. The readout says
-"elbow out of view: predicted" and the 3D panel draws that arm in a darker shade.
+"elbow predicted (out of view)" and the 3D panel draws that arm in a darker shade.
 
 Let the tracker see your whole arm for a second or two first so it learns your arm lengths (press `c` to see
 them). In simulation, with MediaPipe's hidden-elbow guess off by 4 cm per axis, the predicted elbow was off
@@ -119,7 +254,7 @@ differences across the whole body while finger angles come from the hand model's
 
 ## Finger kinematics
 
-Press `f` to show the finger joint table (in POV mode it is always on). Angles are measured in the palm's own
+Press `f` to show the finger joint table (in POV mode it starts on). Angles are measured in the palm's own
 frame, so they do not change when the whole hand moves, and a left hand is mirrored so the signs match.
 
 | Digit | Angles (deg) |
@@ -171,6 +306,9 @@ reported with the wrist because the hand's orientation is what shows them.
    and are expected to be larger.
 2. **Sign check.** Do each motion in the table and confirm the displayed sign.
 3. **Error against ground truth.** Compare against a goniometer or a leader arm before any control.
+4. **Head.** Face the camera squarely and check that yaw, pitch and roll read near zero; then turn, nod and tilt
+   and confirm the signs in the Head table. If the distance `z` is clearly wrong, set `--fov` for your camera.
+5. **Latency.** Watch the status line while you move: the hand should run near the camera rate.
 
 Expect the largest errors in shoulder rotation and forearm rotation: they come from small differences between
 noisy landmarks, and a few centimeters of elbow or wrist error is several degrees over a 25 to 30 cm segment.
@@ -182,6 +320,12 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - One RGB camera gives estimated depth, so angles are most reliable when the arm moves across the camera view.
 - The command mapping stops at 0..1 per joint. Mapping to air muscle pressure needs a calibration curve per muscle.
 - The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once its axes are decided.
-- Tested: 85 unit tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
-  with a tilted camera and missing hips, and PnP hand position recovery; the live loop was run headless in all
-  three modes. Not tested here: real camera accuracy. Use the checks above on your own setup.
+- Recording columns: per arm the gesture, the seven angles, flags and 21 finger angles (`L_` and `R_` prefixes with
+  `--side both`); then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
+  `identity` and `match`. A row is written whenever any model delivers a new result.
+- Tested: 149 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
+  with a tilted camera and missing hips, PnP hand position recovery, all gestures in random orientations for both
+  hands, head pose round trips, emotion alignment against an independent least-squares solution, the threaded
+  pipeline, and the whole app with simulated models. The app was also run headless with the real models on photos
+  (body, both arms, hidden elbows, POV with thumbs up, peace, pointing and open hands). Not tested here: accuracy
+  with a real camera on your setup. Use the checks above.
