@@ -59,3 +59,62 @@ def forward_arm(angles: dict, side: str = "right", body_rotation: np.ndarray | N
     hand[5] = R_w @ ((idx - W) * mirror)
     hand[17] = R_w @ ((pnk - W) * mirror)
     return pose, hand
+
+
+def leg_chain(angles: dict, thigh=0.42, shank=0.40, heel=(-0.06, -0.07, 0.0), toe=(0.17, -0.07, 0.0)) -> dict:
+    """Right leg in pelvis axes (X forward, Y up, Z right) with the hip joint at the origin.
+
+    angles: hip_flexion, hip_abduction, hip_rotation, knee_flexion, ankle_dorsiflexion, ankle_inversion,
+    ankle_abduction (degrees; see legs.py for the signs). heel and toe are offsets from the ankle in the
+    foot frame. Returns points H, K, A, heel, toe and frames R_thigh, R_shank, R_foot. Mirror Z for a left leg.
+    """
+    d = {k: np.radians(float(angles.get(k, 0.0))) for k in (
+        "hip_flexion", "hip_abduction", "hip_rotation", "knee_flexion", "ankle_dorsiflexion", "ankle_inversion",
+        "ankle_abduction")}
+    R_thigh = rot_z(d["hip_flexion"]) @ rot_x(-d["hip_abduction"]) @ rot_y(d["hip_rotation"])
+    R_shank = R_thigh @ rot_z(-d["knee_flexion"])
+    R_foot = R_shank @ rot_z(d["ankle_dorsiflexion"]) @ rot_x(d["ankle_inversion"]) @ rot_y(-d["ankle_abduction"])
+    H = np.zeros(3)
+    K = H - thigh * R_thigh[:, 1]
+    A = K - shank * R_shank[:, 1]
+    return {"H": H, "K": K, "A": A, "heel": A + R_foot @ np.asarray(heel, float),
+            "toe": A + R_foot @ np.asarray(toe, float), "R_thigh": R_thigh, "R_shank": R_shank, "R_foot": R_foot}
+
+
+def core_rotation_matrix(core: dict) -> np.ndarray:
+    """Chest frame in pelvis axes for core_flexion, core_lateral_bend, core_rotation (degrees)."""
+    f, b, r = (np.radians(float(core.get(k, 0.0))) for k in ("core_flexion", "core_lateral_bend", "core_rotation"))
+    return rot_z(-f) @ rot_x(b) @ rot_y(r)
+
+
+def forward_body(legs: dict, core: dict | None = None, pelvic_hike: float = 0.0,
+                 body_rotation: np.ndarray | None = None, body_offset=(0.0, 0.0, 0.0), hip_half=0.09,
+                 trunk=0.50, shoulder_half=0.19, **leg_lengths) -> np.ndarray:
+    """(33, 3) pose with shoulders, hips, knees, ankles, heels and toes for the given angles (degrees).
+
+    legs: {"left": angles, "right": angles} as for `leg_chain`. pelvic_hike: right side of the pelvis
+    raised (the left leg reads the opposite sign). body_rotation: a level frame (forward, up, right as
+    columns) in world axes; the pelvis is that frame tilted by the hike. body_offset: hip midpoint.
+    """
+    from .legs import LEG
+    R_level = np.eye(3) if body_rotation is None else np.asarray(body_rotation, float)
+    U, right = R_level[:, 1], R_level[:, 2]
+    o = np.radians(pelvic_hike)
+    Z = np.cos(o) * right + np.sin(o) * U
+    Y = -np.sin(o) * right + np.cos(o) * U
+    R_p = np.column_stack([np.cross(Y, Z), Y, Z])
+    origin = np.asarray(body_offset, float)
+    pose = np.zeros((33, 3))
+    for side, ang in legs.items():
+        mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
+        c = leg_chain(ang, **leg_lengths)
+        hip = np.array([0.0, 0.0, hip_half])
+        for idx, key in zip(LEG[side], ("H", "K", "A", "heel", "toe")):
+            pose[idx] = origin + R_p @ ((hip + c[key]) * mirror)
+    R_t = core_rotation_matrix(core or {})
+    mid = origin + R_p @ (trunk * R_t[:, 1])
+    pose[R_SHOULDER] = mid + shoulder_half * (R_p @ R_t[:, 2])
+    pose[L_SHOULDER] = mid - shoulder_half * (R_p @ R_t[:, 2])
+    pose[R_HIP] = origin + hip_half * Z
+    pose[L_HIP] = origin - hip_half * Z
+    return pose
