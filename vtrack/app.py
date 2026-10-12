@@ -13,15 +13,18 @@ from pathlib import Path
 
 import numpy as np
 
-from .draw import (CYAN, HAND_EDGES, POSE_ARM_EDGES, YELLOW, compose_layout, draw_head_on_video, draw_wireframe,
-                   render_arms_panel, render_face_panel, render_hand_panel, text_block)
+from .draw import (CYAN, HAND_EDGES, POSE_ARM_EDGES, POSE_LEG_EDGES, YELLOW, compose_layout, draw_head_on_video,
+                   draw_wireframe, render_arms_panel, render_face_panel, render_hand_panel, text_block)
 from .elbow import ElbowPredictor, SegmentLengths
-from .face import EMOTIONS, EmotionSmoother, EmotionTask
+from .emotion_cal import CalibrationSession, calibration_path, load_all
+from .face import EMOTIONS, EmotionSmoother, EmotionTask, softmax
 from .filters import HAND_SMOOTHING, AngleSmoother, JitterMeter, LandmarkSmoother, OneEuroFilter, make_arm_smoothers
 from .fingers import FINGER_KEYS, THUMB_KEYS, HandKinematics, flat, hand_fk, hand_geometry, palm_to_world
 from .gestures import Gesture, GestureFilter, classify_hand
 from .handpose import HandPoseZero, camera_matrix, hand_frame, hand_pose_camera
 from .head import HeadPoseEstimator, HeadPoseZero, angles_from_axes, head_axes_from_angles
+from .legs import (CAMERA_UP, CORE_FIELDS, LEG_FIELDS, CoreAngles, LegAngles, LegKinematics, core_angles,
+                   core_visible, leg_out_of_range, legs_visible, up_from_standing)
 from .kinematics import (_SIDE, ArmAngles, ArmKinematics, frame_agreement_deg, out_of_range, thorax_frame,
                          up_from_neutral)
 from .pipeline import BackgroundGate, CameraReader, ModelWorker, stop_all
@@ -33,6 +36,11 @@ LABELS = {"shoulder_flexion": "Shoulder flex/ext", "shoulder_abduction": "Should
           "shoulder_rotation": "Shoulder rotation", "elbow_flexion": "Elbow flexion",
           "forearm_rotation": "Forearm pro/sup", "wrist_flexion": "Wrist flex/ext",
           "wrist_deviation": "Wrist rad/uln"}
+LEG_LABELS = {"hip_flexion": "Hip flex/ext", "hip_abduction": "Hip abd/add", "hip_rotation": "Hip rotation",
+              "pelvic_hike": "Pelvic hike", "knee_flexion": "Knee flexion", "ankle_dorsiflexion": "Ankle dorsi/plantar",
+              "ankle_inversion": "Ankle inv/ev", "ankle_abduction": "Ankle abd/add", "foot_pitch": "Foot pitch",
+              "foot_roll": "Foot roll"}
+CORE_LABELS = {"core_flexion": "Core flex/ext", "core_lateral_bend": "Core side bend", "core_rotation": "Core rotation"}
 FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
 FINGER_COLS = [f"{f}_{k}" for f in ["index", "middle", "ring", "pinky"] for k in FINGER_KEYS] + \
               [f"thumb_{k}" for k in THUMB_KEYS]
@@ -60,6 +68,8 @@ class Config:
     face_min_hz: float = 10.0          #   and at least this often when the CPU is busy with hands and body
     emotion_hz: float = 10.0
     emotion_min_hz: float = 3.0
+    cal_prepare_s: float = 1.5         # emotion calibration: seconds to get each expression ready
+    cal_capture_s: float = 2.5         #   and seconds recorded
     cores: int | None = None           # CPU cores to plan for (default: all)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
@@ -190,6 +200,14 @@ class App:
         self.gestures = {sd: Gesture.UNKNOWN.value for sd in hand_sides}
         self.angs = {sd: ArmAngles() for sd in self.sides}
         self.missing = {sd: [] for sd in self.sides}
+        # legs and core (both legs always; they are solved whenever they are in view)
+        self.leg_kins = {sd: LegKinematics(sd) for sd in ("left", "right")}
+        self.leg_smooth = {sd: make_arm_smoothers(cfg.smoothing)[1] for sd in ("left", "right")}
+        self.core_smooth = make_arm_smoothers(cfg.smoothing)[1]
+        self.legs = {sd: LegAngles() for sd in ("left", "right")}
+        self.leg_missing = {sd: ["hip", "knee", "ankle"] for sd in ("left", "right")}
+        self.core = CoreAngles()
+        self.leg_up_cal, self.leg_up_src = None, "camera vertical"
         self.pose_w, self.pose_res, self.up_hint, self.up_cal, self.torso_src = None, None, None, None, "-"
         self.thorax = None
         # head and face state
@@ -199,12 +217,15 @@ class App:
         self.head_zero = HeadPoseZero()
         self.emotions, self.emotion_res = None, None
         self.emo_smooth = EmotionSmoother()
+        self.calibrations = load_all(cfg.faces_dir) if cfg.emotion else {}
+        self.cal_session, self.cal_person = None, None
         # pov state
         self.pov_zero, self.pov_info = HandPoseZero(), None
         # ui state
         self.show_wire = True
         self.table_cycle = [None] + hand_sides
         self.table_i = 1 if self.pov else 0
+        self.show_legs = False                     # readout: arm angles, or leg and core angles (key l)
         self.want_check = self.want_calib = False
         self.message, self.message_t = "", 0.0
         self.writer, self._csv_file = None, None
@@ -238,6 +259,8 @@ class App:
         if hand_r is not None:
             self._hand_t = hand_r.t_capture
             self._update_hands(hand_r)
+        if not self.pov and pose_r is not None:
+            self._update_legs(pose_r.t_capture)
         if not self.pov and (pose_r is not None or hand_r is not None) and self.pose_res is not None:
             # The arm combines the newest body and the newest hand result; its time is the newer of the two,
             # and it is solved only when that time advances (the filters need increasing timestamps).
@@ -248,12 +271,12 @@ class App:
         if face_r is not None:
             self._update_head(face_r)
         if emo_r is not None:
-            self.emotion_res = emo_r.value
-            if emo_r.value is None:
-                self.emotions = None
-                self.emo_smooth.reset()
-            else:
-                self.emotions = dict(zip(EMOTIONS, self.emo_smooth(emo_r.value["probs"], emo_r.t_capture)))
+            self._update_emotion(emo_r)
+        if self.want_calib and not self.pov and pose_r is not None:
+            self.want_calib = False
+            self._calibrate_body()
+        if self.cal_session is not None and self.cal_session.finished(time.monotonic() - 0.3):
+            self._finish_emotion_calibration()
         task = self.fns.get("emotion")
         if getattr(task, "message", ""):
             self.say(task.message)
@@ -324,18 +347,6 @@ class App:
             sm = self.ang_smooth[sd]({k: getattr(raw, k) for k in ANGLE_FIELDS}, t)
             self.angs[sd] = dataclasses.replace(raw, **sm, elbow_predicted=est.mode != "measured")
             self.jitter[sd].add(sm, t)
-        if self.want_calib:
-            self.want_calib = False
-            usable = [sd for sd in self.sides if not self.missing[sd] and not self.angs[sd].elbow_predicted]
-            if usable:
-                self.up_cal = up_from_neutral(pose_w, "both" if len(usable) == 2 else usable[0])
-                for k in self.kins.values():
-                    k.reset()
-                for s in self.ang_smooth.values():
-                    s.reset()
-                self.say(f"torso calibrated from the neutral pose ({'+'.join(usable)} arm)")
-            else:
-                self.say("calibration skipped: shoulders, elbows and wrists must be in view")
         if self.want_check:
             self.want_check = False
             fwd = self.thorax[:, 0]
@@ -348,6 +359,107 @@ class App:
                     print(f"{sd} agreement (deg):", {k: round(v, 1) for k, v in
                                                      frame_agreement_deg(pose_w, self.hands_w[sd], sd).items()},
                           "(hand_vs_forearm under ~20 with a straight wrist is good)")
+
+    def _leg_up(self):
+        # Not the arm (desk) calibration: that one assumes the upper arms hang straight down when z is pressed,
+        # which a standing person need not be doing, and the legs need the true vertical.
+        if self.leg_up_cal is not None:
+            return self.leg_up_cal, "standing calibration"
+        return CAMERA_UP, "camera vertical"
+
+    def _update_legs(self, t):
+        pr = self.pose_res
+        if pr is None or pr.value is None or self.pose_w is None:
+            self.legs = {sd: LegAngles() for sd in self.legs}
+            self.leg_missing = {sd: ["hip", "knee", "ankle"] for sd in self.legs}
+            self.core = CoreAngles()
+            self.core_smooth.reset()
+            for sm in self.leg_smooth.values():
+                sm.reset()
+            return
+        vis, pose_w = pr.value.visibility, self.pose_w
+        up, self.leg_up_src = self._leg_up()
+        for sd in self.legs:
+            missing, foot = legs_visible(vis, sd)
+            self.leg_missing[sd] = missing
+            if missing:
+                self.leg_smooth[sd].reset()
+                self.legs[sd] = LegAngles()
+                continue
+            raw = self.leg_kins[sd].solve(pose_w, up, foot=foot)
+            sm = self.leg_smooth[sd]({k: getattr(raw, k) for k in LEG_FIELDS}, t)
+            self.legs[sd] = dataclasses.replace(raw, **sm)
+        if core_visible(vis):
+            c = core_angles(pose_w, up)
+            self.core = CoreAngles(**self.core_smooth({k: getattr(c, k) for k in CORE_FIELDS}, t))
+        else:
+            self.core_smooth.reset()
+            self.core = CoreAngles()
+
+    def _calibrate_body(self):
+        """Key z: arms from the neutral arm pose (desk use) and, when standing in full view, legs and feet."""
+        pr = self.pose_res
+        if pr is None or pr.value is None or self.pose_w is None:
+            self.say("calibration skipped: no body in view")
+            return
+        pose_w, vis = self.pose_w, pr.value.visibility
+        msgs = []
+        usable = [sd for sd in self.sides if not self.missing[sd] and not self.angs[sd].elbow_predicted]
+        if usable:
+            self.up_cal = up_from_neutral(pose_w, "both" if len(usable) == 2 else usable[0])
+            for k in self.kins.values():
+                k.reset()
+            for sm in self.ang_smooth.values():
+                sm.reset()
+            msgs.append(f"torso calibrated from the neutral pose ({'+'.join(usable)} arm)")
+        else:
+            msgs.append("arm calibration skipped: shoulders, elbows and wrists must be in view")
+        seen = {sd: legs_visible(vis, sd) for sd in ("left", "right")}
+        if all(not miss and foot for miss, foot in seen.values()):
+            up = up_from_standing(pose_w)
+            ok = [sd for sd in ("left", "right") if self.leg_kins[sd].calibrate(pose_w, up)]
+            if len(ok) == 2:
+                self.leg_up_cal = up
+                for sm in list(self.leg_smooth.values()) + [self.core_smooth]:
+                    sm.reset()
+                msgs.append("standing calibration done (legs, feet, core)")
+            else:
+                for sd in ok:
+                    self.leg_kins[sd].clear_calibration()
+                msgs.append("standing calibration skipped: stand upright with straight legs, feet flat")
+        elif any(not miss for miss, _ in seen.values()):
+            msgs.append("standing calibration skipped: both legs and feet must be in view")
+        self.say("; ".join(msgs))
+
+    def _update_emotion(self, r):
+        v = r.value
+        self.emotion_res = v
+        if v is None:
+            self.emotions = None
+            self.emo_smooth.reset()
+            return
+        if self.cal_session is not None:
+            self.cal_session.add(v["logits"], r.t_capture)
+        who = v["identity"] or (None if v["enrolled"] else self.cfg.name)
+        cal = self.calibrations.get(who) if who else None
+        person = who if cal is not None else None
+        if person != self.cal_person:              # a different correction: do not blend across it
+            self.cal_person = person
+            self.emo_smooth.reset()
+        probs = cal.probabilities(v["logits"]) if cal is not None else softmax(v["logits"])
+        self.emotions = dict(zip(EMOTIONS, self.emo_smooth(probs, r.t_capture)))
+
+    def _finish_emotion_calibration(self):
+        session, self.cal_session = self.cal_session, None
+        try:
+            cal = session.result()
+        except ValueError as exc:
+            self.say(f"emotion calibration failed: {exc}; press k to try again")
+            return
+        cal.save(calibration_path(self.cfg.faces_dir, session.name))
+        self.calibrations[session.name] = cal
+        self.cal_person = None
+        self.say(f"emotion calibrated for {session.name}: {cal.summary()} ({cal.frames} frames)")
 
     def _update_head(self, r):
         if r.value is None or r.value[1] is None:
@@ -417,12 +529,13 @@ class App:
                 lines.append(f"no {sd} hand in view")
             lines.append(f"gesture: {self.gestures[sd]}")
         else:
-            for sd in self.sides:
+            for sd in self.sides if not self.show_legs else []:
                 if self.missing[sd]:
                     lines.append(f"{sd}: {' and '.join(self.missing[sd])} not in view")
             if self.pose_res is None or self.pose_res.value is None:
-                lines.append("no body: shoulders and the tracked arm must be in view")
-            elif len(self.sides) == 1:
+                lines.append("no body in view" if self.show_legs else
+                             "no body: shoulders and the tracked arm must be in view")
+            elif len(self.sides) == 1 and not self.show_legs:
                 sd = self.sides[0]
                 a, bad, jit = self.angs[sd], set(out_of_range(self.angs[sd])), self.jitter[sd].std()
                 for k in ANGLE_FIELDS if not self.missing[sd] else []:
@@ -439,6 +552,8 @@ class App:
                                  f"{'+-' + num(j) if np.isfinite(j) else ''}{mark}")
                 if not self.missing[sd] and a.elbow_predicted:
                     lines.append("elbow predicted (out of view)")
+            elif self.show_legs:
+                lines += self.leg_lines()
             else:
                 lines.append("\tLEFT\tRIGHT")
                 for k in ANGLE_FIELDS:
@@ -452,7 +567,8 @@ class App:
                 pred = [sd for sd in self.sides if self.angs[sd].elbow_predicted]
                 if pred:
                     lines.append("elbow predicted: " + ", ".join(pred))
-            lines.append(f"torso: {self.torso_src}" + ("  (z: calibrate)" if self.torso_src == "camera vertical" else ""))
+            if not self.show_legs:
+                lines.append(f"torso: {self.torso_src}" + ("  (z: calibrate)" if self.torso_src == "camera vertical" else ""))
             lines.append("gesture: " + "  ".join(f"{sd} {self.gestures[sd]}" for sd in self.sides))
         tsd = self.table_cycle[self.table_i]
         if tsd is not None:
@@ -460,8 +576,33 @@ class App:
         if self.message and now - self.message_t < 4.0:
             lines.append(self.message)
         lines.append(self.status_line(now))
-        keys = "q quit  w wireframe  f fingers  " + ("z zero hand" if self.pov else "z calibrate  h zero head  e enroll face  c checks")
+        keys = "q quit  w wire  f fingers  " + ("z zero hand" if self.pov else
+                                                  "l legs/arms  z calibrate  h zero head  e enroll  k emotion cal  c checks")
         lines.append(keys)
+        return lines
+
+    def leg_lines(self):
+        """Leg (LEFT and RIGHT columns) and core readout. Flags: f hip rotation from the foot (knee straight,
+        ankle abd/add then 0), h held, ! outside the normal range."""
+        lines = ["\tLEFT\tRIGHT"]
+        bad = {sd: set(leg_out_of_range(self.legs[sd])) for sd in self.legs}
+        for k in LEG_FIELDS:
+            cells = []
+            for sd in ("left", "right"):
+                a = self.legs[sd]
+                v = getattr(a, k)
+                flag = "!" if k in bad[sd] else ""
+                if k == "hip_rotation" and np.isfinite(v):
+                    flag += {"foot": "f", "held": "h"}.get(a.hip_rotation_source, "")
+                cells.append(f"{num(v)}{flag}" if np.isfinite(v) else "--")
+            lines.append(f"{LEG_LABELS[k]}\t{cells[0]}\t{cells[1]}")
+        for sd in ("left", "right"):
+            if self.leg_missing[sd]:
+                lines.append(f"{sd} leg: {' and '.join(self.leg_missing[sd])} not in view")
+        for k in CORE_FIELDS:
+            v = getattr(self.core, k)
+            lines.append(f"{CORE_LABELS[k]}\t{num(v) if np.isfinite(v) else '--'}")
+        lines.append(f"up: {self.leg_up_src}" + ("  (z while standing straight)" if self.leg_up_cal is None else ""))
         return lines
 
     def face_panel(self, frame, size):
@@ -497,6 +638,10 @@ class App:
         note = ""
         if "emotion" not in self.workers:
             note = "emotion off (--no-emotion)"
+        elif self.cal_person is not None:
+            note = f"emotion calibrated for {self.cal_person}"
+        elif er is not None:
+            note = "emotion not calibrated for this face (k)"
         return render_face_panel(size, crop, self.emotions, ident, self.head, rel, note)
 
     def render(self, frame):
@@ -506,7 +651,7 @@ class App:
         if self.show_wire:
             pr = self.pose_res
             if pr is not None and pr.value is not None:
-                draw_wireframe(video, pr.value.image, POSE_ARM_EDGES, CYAN, pr.value.visibility)
+                draw_wireframe(video, pr.value.image, POSE_ARM_EDGES + POSE_LEG_EDGES, CYAN, pr.value.visibility)
             hw = self.workers.get("hand")
             hr = hw.get() if hw is not None else None
             for h in (hr.value or []) if hr is not None else []:
@@ -516,6 +661,8 @@ class App:
         if not self.pov:
             video = cv2.flip(video, 1)            # mirror view for a camera facing you
         text_block(video, self.text_lines(now))
+        if self.cal_session is not None:
+            self._banner(video, self.cal_session.prompt(now))
         size = video.shape[0] // 2
         if self.pov:
             info = self.pov_info
@@ -528,8 +675,21 @@ class App:
             kin = render_arms_panel(self.angs, size=size, note=("shoulder rotation held: " + ", ".join(held)) if held else "",
                                     fingers_by_side={sd: (self.fingers[sd], self.finger_geo[sd]) for sd in self.fingers
                                                      if sd in self.sides},
-                                    head_axes=self.neck_axes())
+                                    head_axes=self.neck_axes(),
+                                    legs_by_side={sd: self.legs[sd] for sd in self.legs if not self.leg_missing[sd]},
+                                    core=self.core)
         return compose_layout(video, self.face_panel(frame, size), kin, self.cfg.window_width)
+
+    def _banner(self, img, text):
+        """Large instruction at the bottom of the video (emotion calibration)."""
+        cv2 = self.cv2
+        h, w = img.shape[:2]
+        scale = max(0.6, w / 1280 * 0.85)
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+        y0 = h - th - 34
+        roi = img[y0:h - 10, 10:min(w - 10, tw + 40)]
+        roi[:] = (roi * 0.35).astype(img.dtype)
+        cv2.putText(img, text, (25, h - 26), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 230, 255), 2, cv2.LINE_AA)
 
     def handle_key(self, key):
         k = chr(key) if 0 <= key < 256 else ""
@@ -549,6 +709,20 @@ class App:
                 self.say("head pose zeroed")
             else:
                 self.say("no face: cannot zero the head pose")
+        elif k == "l":
+            self.show_legs = not self.show_legs
+        elif k == "k":
+            if "emotion" not in self.workers:
+                self.say("emotion tracking is off")
+            elif self.cal_session is not None:
+                self.cal_session = None
+                self.say("emotion calibration cancelled")
+            else:
+                er = self.emotion_res
+                who = (er or {}).get("identity") or self.cfg.name
+                self.cal_session = CalibrationSession(who, time.monotonic(), self.cfg.cal_prepare_s,
+                                                      self.cfg.cal_capture_s)
+                self.say(f"emotion calibration for {who}: follow the prompts ({self.cal_session.duration:.0f} s)")
         elif k == "e":
             task = self.fns.get("emotion")
             if task is None:
@@ -571,8 +745,13 @@ class App:
                 p = sd[0].upper() + "_" if len(self.sides) > 1 else ""
                 cols += [p + "gesture", *[p + k for k in ANGLE_FIELDS], p + "shoulder_rotation_valid",
                          p + "wrist_valid", p + "elbow_predicted", *[p + c for c in FINGER_COLS]]
+            for sd in ("left", "right"):
+                p = sd[0].upper() + "_"
+                cols += [p + k for k in LEG_FIELDS] + [p + "hip_rotation_source"]
+            cols += CORE_FIELDS + ["leg_up_source"]
             cols += ["torso_source", "head_x_cm", "head_y_cm", "head_z_cm", "head_yaw", "head_pitch", "head_roll",
-                     "neck_yaw", "neck_pitch", "neck_roll", *[f"emotion_{e}_pct" for e in EMOTIONS], "identity", "match"]
+                     "neck_yaw", "neck_pitch", "neck_roll", *[f"emotion_{e}_pct" for e in EMOTIONS], "identity", "match",
+                     "emotion_calibrated_for"]
         self.writer.writerow(cols)
 
     def write_row(self, t):
@@ -600,10 +779,14 @@ class App:
         neck = angles_from_axes(self.neck_axes(), np.eye(3)) if self.neck_axes() is not None else (nan, nan, nan)
         emo = [round(100 * self.emotions[e], 1) for e in EMOTIONS] if self.emotions else [nan] * len(EMOTIONS)
         er = self.emotion_res
+        for sd in ("left", "right"):
+            a = self.legs[sd]
+            row += [round(getattr(a, k), 2) for k in LEG_FIELDS] + [a.hip_rotation_source]
+        row += [round(getattr(self.core, k), 2) for k in CORE_FIELDS] + [self.leg_up_src]
         row += [self.torso_src, *(np.round(h.position_cm, 2) if h else [nan] * 3),
                 *([round(h.yaw, 2), round(h.pitch, 2), round(h.roll, 2)] if h else [nan] * 3),
                 *[round(v, 2) for v in neck], *emo, (er or {}).get("identity") or "",
-                round(er["match"], 3) if er else nan]
+                round(er["match"], 3) if er else nan, self.cal_person or ""]
         self.writer.writerow(row)
 
     # ------------------------------------------------------------------ loop

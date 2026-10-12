@@ -1,6 +1,6 @@
 # Homunculus Shadowing
 
-Camera-based arm and hand joint tracking so the Homunculus pneumatic arm can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, plus the head's 6 degrees of freedom, face recognition and emotion, from a single webcam.
+Camera-based body tracking so the Homunculus pneumatic arm can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, face recognition and emotion with per-person calibration, from a single webcam.
 
 Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
 
@@ -13,6 +13,8 @@ Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe h
 | `vtrack/tracker.py` | MediaPipe Tasks wrappers (hand, pose, face mesh; VIDEO mode), model download, hand-to-arm matching by position |
 | `vtrack/head.py` | Head pose with 6 DOF (position and yaw, pitch, roll) from 4 anchor points on the face |
 | `vtrack/face.py` | Face detection, emotion (six cardinal emotions plus neutral, in percent) and face recognition |
+| `vtrack/emotion_cal.py` | Per-person emotion calibration: guided capture, fitted correction, held-out accuracy |
+| `vtrack/legs.py` | Legs (hip 4, knee 1, ankle 3, foot 2 DOF each) and core (3 DOF) from the pose landmarks |
 | `vtrack/kinematics.py` | Seven joint angles per arm: shoulder 3 DOF, elbow 1 DOF, wrist 3 DOF, with validity flags |
 | `vtrack/synthetic.py` | Forward kinematics (angles to landmarks and segment frames) for tests, the 3D panel, and a simulated arm |
 | `vtrack/draw.py` | Landmark wireframes and the 3D panels (arm rebuilt from solved angles, or the hand in POV mode) |
@@ -46,12 +48,14 @@ recognition model (38 MB) only when you first enroll your face. On slower comput
 The window has three parts:
 - **Left: the video** (mirrored in body mode, like a mirror) with the landmark wireframe (cyan body, yellow
   hands), the head's four anchor points and its axes (red forward, green up, blue right), and a compact
-  readout in the top left corner: joint angles, gestures, and a status line with each model's rate and latency.
+  readout in the top left corner: joint angles (arms, or legs and core after `l`), gestures, and a status line
+  with each model's rate and latency.
 - **Top right: the face panel.** Your face, who it is (after you enroll), the six cardinal emotions with
   percentages, and the head's 6 DOF (position and yaw, pitch, roll, plus motion since you zeroed it with `h`).
 - **Bottom right: the 3D panel.** In body mode it rebuilds your arms from the solved joint angles through
   forward kinematics, with red/green/blue axes for the upper arm, forearm and hand frames, the fingers from
-  their solved joint angles, and the head turned relative to the torso (the neck). It shows what the solver
+  their solved joint angles, and the head turned relative to the torso (the neck). When your legs are in view
+  it zooms out to the whole body: pelvis, core and both legs with their feet. It shows what the solver
   believes, so if it moves like you the kinematics are right, and if it disagrees with the video the angles
   are wrong. In POV mode it shows the hand.
 
@@ -69,9 +73,11 @@ Keys (click the video window first):
 | Key | Action |
 | --- | --- |
 | `q` | quit |
-| `z` | body mode: calibrate the torso from the neutral pose (see Desk below); POV mode: zero the hand pose |
+| `z` | body mode: calibrate the torso from the neutral arm pose (see Desk below) and, when you stand upright in full view, the legs and feet (see Legs); POV mode: zero the hand pose |
+| `l` | switch the readout between arm angles and leg and core angles |
 | `h` | zero the head pose (the face panel then shows motion since that moment) |
 | `e` | enroll your face for recognition under `--name` (default `me`); press it 3 to 5 times with your head turned slightly differently each time |
+| `k` | calibrate the emotion tracker to your face (about 30 seconds of prompts; `k` again cancels) |
 | `f` | cycle the finger joint table (off, then each tracked hand) |
 | `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
 | `w` | toggle the wireframe |
@@ -211,8 +217,73 @@ works best. From then on the panel shows the name and a match score (cosine simi
 threshold; below that it shows `unknown face`. In tests the same person matched at 0.94 to 0.97 (mirrored,
 darker, smaller), and 22 different people all scored 0.32 or less against them.
 
-Privacy: enrolled faces stay on your computer in `faces/<name>.npy`, 128 numbers per sample and no images.
-Delete that file to remove a person. `faces/` and `models/` are excluded from git.
+**Calibration for your face.** Expression models are less accurate for some faces than others: a resting
+face can read as sad or angry because of its shape rather than its expression, and people show each emotion
+with different strength. Press `k` and follow the prompts at the bottom of the video: for each of the seven
+expressions (neutral, happy, sad, angry, fear, surprise, disgust) you get 1.5 seconds to make it and 2.5
+seconds of recording. A small correction of the model's raw scores is then fitted to your frames (one overall
+scale and one offset per emotion, 8 numbers) and saved in `faces/<name>.emotion.json`.
+
+It is applied whenever the recognizer identifies you (or, if nobody is enrolled, for `--name`); the face
+panel says `emotion calibrated for <name>`. The calibration is per person, not per group of people, because
+what it corrects is how the model reads your face, and only your own frames can measure that.
+
+When it finishes, the readout shows the accuracy on frames the fit did not use (fitted on the first half of
+each expression's frames, scored on the second half), before and after. In simulation, a face that the model
+misread as sad went from 27 to 40% to 83 to 87% held-out accuracy, and a face it already read well stayed
+the same (91 to 93%). Posed expressions are easier than spontaneous ones, so treat your number as a best
+case; recalibrate if the lighting or camera changes a lot.
+
+Privacy: enrolled faces stay on your computer in `faces/<name>.npy`, 128 numbers per sample and no images,
+and calibrations in `faces/<name>.emotion.json`. Delete those files to remove a person. `faces/` and `models/`
+are excluded from git.
+
+## Legs and core (10 DOF per leg, 3 in the core)
+
+Legs and core are tracked whenever they are in view, in body mode: stand about 2.5 to 3.5 m from the camera
+so you are in the frame from head to feet. Press `l` to see them in the readout. Each leg needs its hip, knee
+and ankle in view (both hips for the pelvis); ankle and foot angles also need the heel and toe.
+
+| Joint | Angle | Positive direction |
+| --- | --- | --- |
+| Hip | `hip_flexion` | thigh forward (extension negative) |
+| Hip | `hip_abduction` | thigh outward (adduction negative) |
+| Hip | `hip_rotation` | internal (external negative), about the thigh's long axis |
+| Hip | `pelvic_hike` | this side of the pelvis raised (dropped negative); the two legs read opposite signs |
+| Knee | `knee_flexion` | bent; 0 is straight |
+| Ankle | `ankle_dorsiflexion` | toes up (pointing the foot is negative) |
+| Ankle | `ankle_inversion` | sole turned inward (eversion negative) |
+| Ankle | `ankle_abduction` | toes turned outward (inward negative) |
+| Foot | `foot_pitch` | foot relative to the floor: toes up |
+| Foot | `foot_roll` | foot relative to the floor: outer edge down, sole facing inward |
+| Core | `core_flexion` | bending forward (backward negative) |
+| Core | `core_lateral_bend` | bending to your right |
+| Core | `core_rotation` | chest turned to your left relative to the hips (same direction as head yaw) |
+
+Zero is standing upright, legs straight, feet flat and pointing forward. Both legs use the same signs. Hip,
+ankle and core angles are Z-X-Y sequences (lateral axis, then forward, then the long axis), the order the
+ISB recommends; the core is the chest (shoulders) relative to the pelvis (hips). Recorded as `L_` and `R_`
+columns plus `core_*`.
+
+**Calibrate standing.** Stand upright, legs straight, feet flat on the floor and pointing forward, whole body
+in view, and press `z`. This takes "up" from your legs (otherwise the camera's vertical is used, so a tilted
+camera reads as hip and core flexion) and removes the offset between MediaPipe's heel, toe and ankle points
+and your foot's real axes. The readout's last leg line says which "up" is in use.
+
+What the camera cannot tell you, and what the tracker does about it:
+- **Pelvic tilt (forward and back).** MediaPipe gives only the two hip joints for the pelvis, so its forward
+  tilt cannot be seen. The pelvis is taken as level front to back: hip flexion is the thigh from vertical, and
+  core flexion includes any pelvic tilt. Pelvic hike (side to side) and turning are measured.
+- **Hip rotation with a straight knee.** The knee's hinge axis is only defined when the knee bends. Below 20
+  degrees the hip rotation is taken from the direction your foot points, assuming the ankle itself is not
+  turned (`ankle_abduction` then reads 0; the readout marks hip rotation `f`). Without the feet in view it is
+  held (`h`).
+- **Feet are rough.** Each foot has just three points (ankle, heel, toe tip), and their depth comes from a
+  single camera. On a real yoga photo (warrior II), the bent front knee read 82 degrees (it looks about 90
+  in the photo), but the straight back knee read 26 degrees instead of nearly 0, and its foot roll was clearly
+  wrong.
+  Mirroring the same photo read the straight knee at 10 degrees. Expect the knees and hips to be usable and
+  the ankle and foot angles to be approximate, best when the legs move across the camera's view.
 
 ## Elbow prediction
 
@@ -309,6 +380,10 @@ reported with the wrist because the hand's orientation is what shows them.
 4. **Head.** Face the camera squarely and check that yaw, pitch and roll read near zero; then turn, nod and tilt
    and confirm the signs in the Head table. If the distance `z` is clearly wrong, set `--fov` for your camera.
 5. **Latency.** Watch the status line while you move: the hand should run near the camera rate.
+6. **Legs.** Stand in full view, press `z`, then `l`: everything should read near zero. Bend one knee, lift a
+   thigh forward and out, and turn a foot out, and confirm the signs in the Legs table.
+7. **Emotion.** Press `k` and follow the prompts; the held-out accuracy afterwards tells you how well the
+   tracker reads your face in your lighting.
 
 Expect the largest errors in shoulder rotation and forearm rotation: they come from small differences between
 noisy landmarks, and a few centimeters of elbow or wrist error is several degrees over a 25 to 30 cm segment.
@@ -321,11 +396,14 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - The command mapping stops at 0..1 per joint. Mapping to air muscle pressure needs a calibration curve per muscle.
 - The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once its axes are decided.
 - Recording columns: per arm the gesture, the seven angles, flags and 21 finger angles (`L_` and `R_` prefixes with
-  `--side both`); then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
-  `identity` and `match`. A row is written whenever any model delivers a new result.
-- Tested: 149 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms, desk calibration
-  with a tilted camera and missing hips, PnP hand position recovery, all gestures in random orientations for both
-  hands, head pose round trips, emotion alignment against an independent least-squares solution, the threaded
-  pipeline, and the whole app with simulated models. The app was also run headless with the real models on photos
-  (body, both arms, hidden elbows, POV with thumbs up, peace, pointing and open hands). Not tested here: accuracy
+  `--side both`); per leg the ten leg angles and the hip rotation source (`L_` and `R_`), the three core angles and
+  `leg_up_source`; then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
+  `identity`, `match` and `emotion_calibrated_for`. A row is written whenever any model delivers a new result.
+- Tested: 168 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
+  and the core (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted
+  camera, PnP hand position recovery, all gestures in random orientations for both hands, head pose round trips,
+  emotion alignment against an independent least-squares solution, the emotion calibration fit (gradient checked,
+  recovers known corrections), the threaded pipeline, and the whole app with simulated models, including a full
+  emotion calibration. The app was also run headless with the real models on photos (body, both arms, hidden
+  elbows, a full-body yoga pose, POV with thumbs up, peace, pointing and open hands). Not tested here: accuracy
   with a real camera on your setup. Use the checks above.

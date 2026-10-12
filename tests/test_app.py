@@ -13,7 +13,9 @@ from vtrack.app import App, Config, num, pick_hand_by_label
 from vtrack.face import EMOTIONS
 from vtrack.handpose import camera_matrix
 from vtrack.head import FACING_CAMERA, HeadPoseEstimator
-from vtrack.synthetic import forward_arm
+from vtrack.emotion_cal import CAL_ORDER, calibration_path
+from vtrack.legs import LEG_FIELDS
+from vtrack.synthetic import forward_arm, forward_body
 from vtrack.tracker import HandResult, PoseResult
 
 W, H = 1280, 720
@@ -23,6 +25,10 @@ ARM = dict(shoulder_flexion=35, shoulder_abduction=25, shoulder_rotation=30, elb
 HEAD = (12.0, -8.0, 5.0)                       # yaw, pitch, roll
 PROBS = np.array([0.02, 0.01, 0.03, 0.70, 0.14, 0.05, 0.05])
 OFFSET = np.array([0.0, 0.1, 2.0])             # body origin (hips) in front of the camera, meters
+LEGS = {"right": dict(hip_flexion=30, hip_abduction=10, hip_rotation=15, knee_flexion=50, ankle_dorsiflexion=10,
+                      ankle_inversion=5, ankle_abduction=5),
+        "left": dict(hip_flexion=-5, hip_abduction=8, hip_rotation=-12, knee_flexion=6, ankle_dorsiflexion=-8,
+                     ankle_inversion=-4, ankle_abduction=0)}      # knee straight: hip rotation from the foot
 
 
 def project(points):
@@ -39,8 +45,14 @@ class FakeCap:
         return True, np.full((H, W, 3), 80, np.uint8)
 
 
-def scene():
-    pose_w, _ = forward_arm(ARM, "right", body_rotation=FACING_CAMERA)       # person facing the camera
+def scene(legs_angles=None, R=FACING_CAMERA):
+    """R: body frame (forward, up, right) in camera axes; FACING_CAMERA is a person facing a level camera."""
+    pose_w, _ = forward_arm(ARM, "right", body_rotation=R)
+    # legs on the same torso (forward_arm puts the hips 0.5 m below the shoulders, 0.1 m to each side)
+    legs = forward_body(legs_angles or LEGS, None, 0.0, R, R @ np.array([0.0, -0.5, 0.0]), hip_half=0.1,
+                        trunk=0.5, shoulder_half=0.2)
+    assert np.allclose(legs[[11, 12, 23, 24]], pose_w[[11, 12, 23, 24]])
+    pose_w[25:33] = legs[25:33]
     hand_w = hand_palm(False, ("index", "middle"))                          # peace sign
     hand_w = hand_w - hand_w.mean(axis=0)
     hand_img = project(hand_w - hand_w[0] + pose_w[16] + OFFSET)            # wrist on the pose wrist
@@ -48,18 +60,28 @@ def scene():
 
 
 class FakeEmotion:
+    """Model outputs PROBS; with `expression` set, raw scores for a face the model misreads as sad."""
+
     def __init__(self):
-        self.enroll_request, self.message, self.enrolled = None, "", False
+        self.enroll_request, self.message, self.enrolled, self.expression = None, "", False, None
+        self.rng = np.random.default_rng(0)
 
     def __call__(self, frame):
         if self.enroll_request:
             self.enroll_request, self.message, self.enrolled = None, "enrolled me (1 sample)", True
-        return dict(box=np.array([600.0, 100.0, 120.0, 140.0]), probs=PROBS, identity="me" if self.enrolled else None,
-                    match=0.95 if self.enrolled else -1.0, enrolled=self.enrolled)
+        if self.expression is None:
+            logits = np.log(PROBS)
+        else:
+            logits = self.rng.normal(scale=0.5, size=7)
+            logits[EMOTIONS.index(self.expression(frame.t))] += 3.0
+            logits[EMOTIONS.index("sad")] += 4.0
+        return dict(box=np.array([600.0, 100.0, 120.0, 140.0]), logits=logits, probs=np.exp(logits) / np.exp(logits).sum(),
+                    identity="me" if self.enrolled else None, match=0.95 if self.enrolled else -1.0,
+                    enrolled=self.enrolled)
 
 
-def fake_models(mode="body"):
-    pose_w, pose_img, hand_w, hand_img = scene()
+def fake_models(mode="body", legs_angles=None, R=FACING_CAMERA):
+    pose_w, pose_img, hand_w, hand_img = scene(legs_angles, R)
     vis = np.ones(33)
     L, _ = landmarks_for(*HEAD, pos=(0.0, -0.45, 1.9))
     est = HeadPoseEstimator()
@@ -117,6 +139,16 @@ def test_body_mode_end_to_end(tmp_path):
     # status line has every worker and no errors
     status = app.status_line(time.monotonic())
     assert all(n in status for n in ("cam", "hand", "pose", "face", "emotion")) and "ERROR" not in status
+    # legs and core
+    for sd in ("left", "right"):
+        for k, v in LEGS[sd].items():
+            assert getattr(app.legs[sd], k) == pytest.approx(v, abs=0.5), (sd, k)
+        assert app.legs[sd].pelvic_hike == pytest.approx(0, abs=0.5)
+    assert app.legs["left"].hip_rotation_source == "foot" and app.legs["right"].hip_rotation_source == "knee"
+    assert (app.core.core_flexion, app.core.core_lateral_bend, app.core.core_rotation) == pytest.approx((0, 0, 0), abs=0.5)
+    app.show_legs = True
+    text = "\n".join(app.text_lines(time.monotonic()))
+    assert "Knee flexion\t6.0\t50.0" in text and "-12.0f" in text and "Core rotation\t0.0" in text
 
     rows = list(csv.reader(open(rec, encoding="utf-8")))
     header, data = rows[0], rows[1:]
@@ -124,6 +156,8 @@ def test_body_mode_end_to_end(tmp_path):
     ts = [float(r[0]) for r in data]
     assert ts == sorted(ts)
     last = dict(zip(header, data[-1]))
+    assert float(last["R_knee_flexion"]) == pytest.approx(50, abs=0.5) and last["L_hip_rotation_source"] == "foot"
+    assert all("L_" + k in header and "R_" + k in header for k in LEG_FIELDS) and "core_rotation" in header
     assert last["gesture"] == "peace" and last["identity"] == "me"
     assert float(last["neck_yaw"]) == pytest.approx(HEAD[0], abs=0.3)
     assert float(last["neck_pitch"]) == pytest.approx(HEAD[1], abs=0.3)
@@ -166,3 +200,60 @@ def test_model_load_failure_stops_the_camera():
     cap = FakeCap()
     with pytest.raises(OSError):
         App(Config(), cap, {"hand": broken})
+
+
+def test_emotion_calibration_through_the_app(tmp_path):
+    cfg = Config(side="right", faces_dir=str(tmp_path), name="shyam", cores=8, emotion_hz=30,
+                 cal_prepare_s=0.15, cal_capture_s=0.35)
+    app = App(cfg, FakeCap(), fake_models())
+    fake = app.fns["emotion"]
+    fake.expression = lambda t: "neutral"                    # a resting face the model reads as sad
+    last, t0 = 0, time.monotonic()
+    while time.monotonic() - t0 < 0.5:
+        f = app.camera.wait_newer(last, 2.0)
+        last = f.index
+        app.step(f)
+    assert max(app.emotions, key=app.emotions.get) == "sad" and app.cal_person is None
+    app.handle_key(ord("k"))
+    session = app.cal_session
+
+    def prompted(t):                                         # the person follows the on-screen prompt
+        return CAL_ORDER[min(session.phase(t)[0], len(CAL_ORDER) - 1)]
+
+    fake.expression = prompted
+    try:
+        while app.cal_session is not None and time.monotonic() - t0 < 15:
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            app.step(f)
+        fake.expression = lambda t: "neutral"
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < 1.0:
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            app.step(f)
+    finally:
+        app.close()
+    assert "emotion calibrated for shyam" in app.message, app.message
+    assert calibration_path(tmp_path, "shyam").exists() and "shyam" in app.calibrations
+    cal = app.calibrations["shyam"]
+    assert cal.accuracy_after > cal.accuracy_before
+    assert app.cal_person == "shyam" and max(app.emotions, key=app.emotions.get) == "neutral"
+
+
+def test_standing_calibration_corrects_a_tilted_camera():
+    from vtrack.kinematics import rot_x
+    straight = {k: 0.0 for k in LEGS["right"]}
+    R = rot_x(np.radians(15)) @ FACING_CAMERA              # camera pitched 15 degrees
+    app = App(Config(side="right", cores=8), FakeCap(), fake_models(legs_angles={"left": straight, "right": straight}, R=R))
+    run_app(app, 0.4)
+    before = app.legs["right"].hip_flexion
+    app2 = App(Config(side="right", cores=8), FakeCap(), fake_models(legs_angles={"left": straight, "right": straight}, R=R))
+    run_app(app2, 1.0, keys={5: "z"})
+    assert abs(before) > 10                                  # the camera's tilt reads as hip flexion
+    assert app2.leg_up_src == "standing calibration" and "standing calibration done" in app2.message
+    for sd in ("left", "right"):
+        a = app2.legs[sd]
+        for k in ("hip_flexion", "hip_abduction", "knee_flexion", "ankle_dorsiflexion", "foot_pitch", "foot_roll"):
+            assert getattr(a, k) == pytest.approx(0.0, abs=0.5), (sd, k)
+    assert app2.core.core_flexion == pytest.approx(0.0, abs=0.5)

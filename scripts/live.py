@@ -1,7 +1,8 @@
 """Live tracking: arms, fingers, gestures, head pose, face recognition and emotion, from a webcam.
 
-Body mode (default): seven arm joint angles per arm, finger joints and gestures, the head's 6 degrees of
-freedom, and emotion and face recognition, from a webcam that sees you.
+Body mode (default): seven arm joint angles per arm, finger joints and gestures, 10 joint angles per leg
+and 3 in the core (when they are in view), the head's 6 degrees of freedom, and emotion and face
+recognition, from a webcam that sees you.
     python scripts/live.py --side right                 # standing, hips in view
     python scripts/live.py --side right --torso desk    # seated at a desk, hips hidden
     python scripts/live.py --side both --torso desk     # both arms at once
@@ -13,10 +14,13 @@ face or emotion models. The status line shows the camera rate and each model's r
 
 Keys (click the video window first):
     q  quit
-    z  body: calibrate torso up from the neutral pose (needed for --torso desk)
+    z  body: calibrate. Arms: torso up from the neutral arm pose (needed for --torso desk). Legs: standing
+             upright with straight legs and feet flat, in full view, sets "up" and zeroes the feet.
        pov:  set the current hand pose as zero for relative motion
+    l  body: switch the readout between arm angles and leg and core angles
     h  body: set the current head pose as zero for relative head motion
     e  body: enroll your face for recognition, under --name (press a few times from different angles)
+    k  body: calibrate the emotion tracker to your face: make each expression when asked (about 30 s)
     f  cycle the finger joint table (off, then each tracked hand)
     c  body: print axis and hand/pose agreement checks to the terminal
     w  toggle the wireframe overlay

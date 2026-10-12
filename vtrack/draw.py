@@ -16,6 +16,7 @@ from .synthetic import arm_chain
 
 POSE_ARM_EDGES = [(11, 12), (11, 13), (13, 15), (12, 14), (14, 16), (11, 23), (12, 24), (23, 24),
                   (15, 17), (15, 19), (17, 19), (15, 21), (16, 18), (16, 20), (18, 20), (16, 22)]
+POSE_LEG_EDGES = [(23, 25), (25, 27), (27, 29), (29, 31), (27, 31), (24, 26), (26, 28), (28, 30), (30, 32), (28, 32)]
 HAND_EDGES = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 8), (5, 9), (9, 10), (10, 11),
               (11, 12), (9, 13), (13, 14), (14, 15), (15, 16), (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)]
 
@@ -69,8 +70,8 @@ def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-2
 
 
 def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", fingers_by_side=None,
-                      head_axes=None):
-    """3D view of the torso and arms rebuilt from solved angles. Returns a BGR image.
+                      head_axes=None, legs_by_side=None, core=None):
+    """3D view of the body rebuilt from solved angles. Returns a BGR image.
 
     angles_by_side: {"right": ArmAngles or dict, "left": ...}; either side may be omitted or all NaN.
     fingers_by_side: optional {side: (finger angles, hand geometry)} from fingers.py; when given, that
@@ -78,29 +79,102 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
     An arm whose elbow was predicted (out of view) is drawn in a darker shade.
     head_axes: optional (3, 3) head axes (forward, up, right) in the torso frame; draws the head with its
     four anchor points above the shoulders.
-    Drawn as a mirror view (your right arm on the right), matching the mirrored video. Small
+    legs_by_side: optional {side: LegAngles or dict} and core: optional CoreAngles or dict (legs.py). When a
+    leg is given the view zooms out to the whole body standing on the pelvis: the pelvis tilts with the
+    pelvic hike, the chest turns on it by the core angles, and the legs hang from it.
+    Drawn as a mirror view (your right side on the right), matching the mirrored video. Small
     red/green/blue axes show each segment's frame: upper arm at the elbow, forearm at the wrist,
-    hand at the knuckles.
+    hand at the knuckles, thigh at the knee, foot at the ankle.
     """
+    from .legs import LEG_FIELDS
+    from .synthetic import core_rotation_matrix, leg_chain
     cv2 = _cv2()
     img = np.full((size, size, 3), 25, np.uint8)
     view = _view(yaw_deg, pitch_deg, "z")
-    center, scale = (size // 2, int(size * 0.36)), size * 0.72
+
+    def get_all(obj, keys):
+        if obj is None:
+            return None
+        g = (lambda k: obj[k]) if isinstance(obj, dict) else (lambda k: getattr(obj, k))
+        return {k: float(g(k)) for k in keys}
+
+    legs = {}
+    for side, la in (legs_by_side or {}).items():
+        v = get_all(la, LEG_FIELDS)
+        if v is not None and all(np.isfinite(v[k]) for k in ("hip_flexion", "hip_abduction", "hip_rotation",
+                                                             "knee_flexion")):
+            legs[side] = v
+    full = bool(legs)
+    if full:
+        cv = get_all(core, ["core_flexion", "core_lateral_bend", "core_rotation"]) or {}
+        R_core = core_rotation_matrix({k: (x if np.isfinite(x) else 0.0) for k, x in cv.items()})
+        hikes = [legs[sd]["pelvic_hike"] * (1 if sd == "right" else -1) for sd in legs
+                 if np.isfinite(legs[sd]["pelvic_hike"])]
+        R_tilt = rot_x(-math.radians(hikes[0])) if hikes else np.eye(3)
+        R_base = R_tilt @ R_core                       # chest axes in the drawing
+        shift = np.array([0.0, 0.5, 0.0])               # chest origin (shoulder midpoint) above the hips
+        center, scale = (size // 2, int(size * 0.50)), size * 0.44
+    else:
+        R_tilt = R_base = np.eye(3)
+        shift = np.zeros(3)
+        center, scale = (size // 2, int(size * 0.36)), size * 0.72
+
+    def B(p):                                           # chest (thorax) coordinates -> drawing
+        return R_base @ (np.asarray(p, float) + shift) if full else np.asarray(p, float)
 
     def pr(*pts):
-        return _project(pts, view, center, scale)
+        return _project([B(q) for q in pts], view, center, scale)
 
-    for g in np.linspace(-0.4, 0.4, 5):                 # floor grid for depth cues
-        a, b = pr(np.array([g, -0.5, -0.4]), np.array([g, -0.5, 0.4]))
-        cv2.line(img, a, b, (45, 45, 45), 1)
-        a, b = pr(np.array([-0.4, -0.5, g]), np.array([0.4, -0.5, g]))
-        cv2.line(img, a, b, (45, 45, 45), 1)
-    rs, ls, rh, lh = pr(np.array([0, 0, 0.2]), np.array([0, 0, -0.2]),
-                        np.array([0, -0.5, 0.1]), np.array([0, -0.5, -0.1]))
+    def prp(*pts):                                      # pelvis coordinates -> drawing
+        return _project([R_tilt @ np.asarray(q, float) for q in pts], view, center, scale)
+
+    chains = {sd: leg_chain({k: (x if np.isfinite(x) else 0.0) for k, x in v.items()})   # unseen foot: neutral
+              for sd, v in legs.items()}
+    if full:
+        hip_r = np.array([0.0, 0.0, 0.1])
+        floor = min([(R_tilt @ ((hip_r + c[k]) * np.array([1, 1, -1 if sd == "left" else 1])))[1]
+                     for sd, c in chains.items() for k in ("heel", "toe", "A")] + [-0.6])
+        grid = [(np.array([g, floor, -0.5]), np.array([g, floor, 0.5])) for g in np.linspace(-0.5, 0.5, 5)]
+        grid += [(np.array([-0.5, floor, g]), np.array([0.5, floor, g])) for g in np.linspace(-0.5, 0.5, 5)]
+        for a, b in grid:
+            a, b = _project([a, b], view, center, scale)
+            cv2.line(img, a, b, (45, 45, 45), 1)
+        rs, ls = pr(np.array([0, 0, 0.2]), np.array([0, 0, -0.2]))
+        rh, lh = prp(np.array([0, 0, 0.1]), np.array([0, 0, -0.1]))
+    else:
+        for g in np.linspace(-0.4, 0.4, 5):                 # floor grid for depth cues
+            a, b = pr(np.array([g, -0.5, -0.4]), np.array([g, -0.5, 0.4]))
+            cv2.line(img, a, b, (45, 45, 45), 1)
+            a, b = pr(np.array([-0.4, -0.5, g]), np.array([0.4, -0.5, g]))
+            cv2.line(img, a, b, (45, 45, 45), 1)
+        rs, ls, rh, lh = pr(np.array([0, 0, 0.2]), np.array([0, 0, -0.2]),
+                            np.array([0, -0.5, 0.1]), np.array([0, -0.5, -0.1]))
     for a, b in ((rs, ls), (rs, rh), (ls, lh), (rh, lh)):
         cv2.line(img, a, b, GREY, 2, cv2.LINE_AA)
     cv2.putText(img, "R", (rs[0] + 8, rs[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ARM_COLORS["right"], 2)
     cv2.putText(img, "L", (ls[0] - 22, ls[1] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, ARM_COLORS["left"], 2)
+
+    for side, c in chains.items():
+        v = legs[side]
+        mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
+        hip = np.array([0.0, 0.0, 0.1])
+        P = {k: (hip + c[k]) * mirror for k in ("H", "K", "A", "heel", "toe")}
+        h, k, a, hl, t = prp(P["H"], P["K"], P["A"], P["heel"], P["toe"])
+        col = ARM_COLORS[side]
+        cv2.line(img, h, k, col, 4, cv2.LINE_AA)
+        cv2.line(img, k, a, col, 4, cv2.LINE_AA)
+        foot_ok = np.isfinite(v["ankle_dorsiflexion"])
+        foot_col = YELLOW if foot_ok else GREY
+        for p1, p2 in ((a, hl), (hl, t), (t, a)):
+            cv2.line(img, p1, p2, foot_col, 2, cv2.LINE_AA)
+        for q in (h, k, a):
+            cv2.circle(img, q, 5, WHITE, -1, cv2.LINE_AA)
+        frames = [(P["K"], c["R_thigh"])] + ([(P["A"], c["R_foot"])] if foot_ok else [])
+        for origin, R in frames:
+            R = R * mirror[:, None]
+            for i in range(3):
+                a1, b1 = prp(origin, origin + 0.08 * R[:, i])
+                cv2.arrowedLine(img, a1, b1, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
 
     drawn = 0
     for side, angles in angles_by_side.items():
@@ -118,11 +192,11 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         c = arm_chain(vals)
         mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
         P = {k: c[k] * mirror for k in ("S", "E", "W", "K", "index", "pinky")}
-        s, e, w, k, ix, pk = pr(P["S"], P["E"], P["W"], P["K"], P["index"], P["pinky"])
+        s_, e, w, k, ix, pk = pr(P["S"], P["E"], P["W"], P["K"], P["index"], P["pinky"])
         col = ARM_COLORS[side]
         if not isinstance(angles, dict) and getattr(angles, "elbow_predicted", False):
             col = tuple(int(x * 0.5) for x in col)
-        cv2.line(img, s, e, col, 4, cv2.LINE_AA)
+        cv2.line(img, s_, e, col, 4, cv2.LINE_AA)
         cv2.line(img, e, w, col, 4, cv2.LINE_AA)
         hand_col = YELLOW if wrist_ok else GREY
         fing = (fingers_by_side or {}).get(side)
@@ -135,7 +209,7 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         else:
             for a, b in ((w, ix), (w, pk), (ix, pk), (w, k)):
                 cv2.line(img, a, b, hand_col, 2, cv2.LINE_AA)
-        for p in (s, e, w):
+        for p in (s_, e, w):
             cv2.circle(img, p, 6, WHITE, -1, cv2.LINE_AA)
         for origin, R in ((P["E"], c["R_h"]), (P["W"], c["R_f"]), (P["K"], c["R_hand"])):
             R = R * mirror[:, None]
@@ -157,7 +231,7 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         for i in range(3):
             a, b = pr(head_c, head_c + 0.13 * head_axes[:, i])
             cv2.arrowedLine(img, a, b, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
-    if drawn == 0:
+    if drawn == 0 and not full:
         cv2.putText(img, "no arm pose", (20, size // 2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
     cv2.putText(img, "solved kinematics (mirror view)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
     if note:
