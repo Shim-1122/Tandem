@@ -64,3 +64,25 @@ def test_hand_vs_forearm_zero_with_straight_wrist_and_large_when_hand_axes_rotat
     target = np.cos(np.radians(50)) * long_axis + np.sin(np.radians(50)) * np.cross(k, long_axis)
     rotated = hand @ shortest_arc(long_axis, target).T
     assert frame_agreement_deg(pose, rotated, "right")["hand_vs_forearm_deg"] == pytest.approx(50, abs=1e-6)
+
+
+def test_assign_hands_gives_each_hand_to_one_side_only():
+    from vtrack.tracker import assign_hands
+    # arms crossed: one hand lies between the two wrists, a little closer to the right one
+    lone = hand_at(0.48, 0.5)
+    res = FrameResult(hands=[lone], pose_image=pose_with_wrists((0.55, 0.5), (0.45, 0.5)))
+    out = assign_hands(res, ["left", "right"])
+    assert out["right"] is lone and out["left"] is None
+    # pick_hand looks at one side at a time and would hand the same hand to both
+    assert pick_hand(res, "left") is lone and pick_hand(res, "right") is lone
+
+
+def test_assign_hands_two_hands_and_misses():
+    from vtrack.tracker import assign_hands
+    a, b = hand_at(0.31, 0.5), hand_at(0.69, 0.5)
+    res = FrameResult(hands=[a, b], pose_image=pose_with_wrists((0.7, 0.5), (0.3, 0.5)))
+    assert assign_hands(res, ["left", "right"]) == {"left": b, "right": a}
+    assert assign_hands(res, ["right"]) == {"right": a}
+    far = FrameResult(hands=[hand_at(0.9, 0.9)], pose_image=pose_with_wrists((0.1, 0.1), (0.2, 0.2)))
+    assert assign_hands(far, ["left", "right"]) == {"left": None, "right": None}
+    assert assign_hands(FrameResult(), ["right"]) == {"right": None}
