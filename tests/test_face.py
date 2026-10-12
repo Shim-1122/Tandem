@@ -115,8 +115,8 @@ class _Detector:
 
 
 class _Emotion:
-    def probabilities(self, bgr, landmarks5):
-        return np.eye(7)[3]
+    def logits(self, bgr, landmarks5):
+        return np.eye(7)[3] * 30.0
 
 
 class _Recognizer:
@@ -155,7 +155,8 @@ def test_emotion_task_enrolls_then_recognizes_at_a_limited_rate():
     rec = _Recognizer()
     t = _task([FACE], rec)
     out = t(_Frame(0.0))
-    assert out["identity"] is None and not out["enrolled"] and out["probs"][3] == 1.0
+    assert out["identity"] is None and not out["enrolled"] and out["probs"][3] == pytest.approx(1.0)
+    assert out["logits"][3] == 30.0
     t.enroll_request = "me"
     out = t(_Frame(0.1))
     assert t.message == "enrolled me (1 sample)" and t.enroll_request is None

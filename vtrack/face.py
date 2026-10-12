@@ -128,13 +128,17 @@ class EmotionModel:
         import cv2
         return cv2.warpAffine(bgr, similarity_transform(landmarks5, FER_TEMPLATE), (112, 112))
 
-    def probabilities(self, bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
-        """Seven probabilities in EMOTIONS order (sum 1)."""
+    def logits(self, bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
+        """The model's seven raw scores in EMOTIONS order (softmax of these gives the probabilities)."""
         import cv2
         img = cv2.cvtColor(self.aligned(bgr, landmarks5), cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         img = (img - 0.5) / 0.5
         self.net.setInput(cv2.dnn.blobFromImage(img), "data")
-        return softmax(self.net.forward("label").reshape(-1))
+        return self.net.forward("label").reshape(-1).astype(np.float64)
+
+    def probabilities(self, bgr: np.ndarray, landmarks5: np.ndarray) -> np.ndarray:
+        """Seven probabilities in EMOTIONS order (sum 1)."""
+        return softmax(self.logits(bgr, landmarks5))
 
 
 class FaceRecognizer:
@@ -202,7 +206,8 @@ class EmotionTask:
     """Worker function for the live app: face detection, emotion and, once someone is enrolled, recognition.
 
     Called with a frame (attributes t and bgr); returns None without a face, else a dict with the face box,
-    the seven emotion probabilities, the recognized name (or None) and its match score. Recognition runs at
+    the model's seven raw emotion scores and their (uncalibrated) probabilities, the recognized name (or
+    None) and its match score. Recognition runs at
     most every `recognize_every_s` seconds; set `enroll_request` to a name to add the current face.
     """
 
@@ -226,7 +231,7 @@ class EmotionTask:
             self._last_id = (None, -1.0, -1e9)        # a new face is identified from scratch
             return None
         d = dets[0]
-        probs = self.emotion.probabilities(frame.bgr, d.landmarks5)
+        logits = self.emotion.logits(frame.bgr, d.landmarks5)
         name, score, t_id = self._last_id
         if self.enroll_request:
             who, self.enroll_request = self.enroll_request, None
@@ -242,5 +247,5 @@ class EmotionTask:
             name, score = self.recognizer.identify(self.recognizer.embedding(frame.bgr, d))
             t_id = frame.t
             self._last_id = (name, score, t_id)
-        return dict(box=d.box, probs=probs, identity=name, match=score,
+        return dict(box=d.box, logits=logits, probs=softmax(logits), identity=name, match=score,
                     enrolled=bool(self.recognizer and self.recognizer.gallery))
