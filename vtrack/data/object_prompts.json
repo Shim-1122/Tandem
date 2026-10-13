@@ -1,0 +1,40 @@
+{
+  "_about": "Objects the grasp tracker detects. Each class lists phrasings (its score is the best one). 'track' classes are tracked and get a grip from vtrack/grip.py; 'helpers' are detected only so that they are not mistaken for a tracked object. 'attributes' are scored on every detection (the water bottle's material). After editing, run: python scripts/object_vocab.py",
+  "track": {
+    "tennis ball": ["tennis ball", "yellow tennis ball"],
+    "ping pong ball": ["ping pong ball", "table tennis ball", "white ping-pong ball"],
+    "soccer ball": ["soccer ball", "black and white soccer ball"],
+    "basketball": ["basketball", "orange basketball"],
+    "american football": ["american football", "american football ball", "rugby ball"],
+    "tennis racket": ["tennis racket", "tennis racquet"],
+    "ping pong paddle": ["ping pong paddle", "table tennis racket", "table tennis bat"],
+    "cell phone": ["cell phone", "smartphone"],
+    "pen": ["pen"],
+    "pencil": ["pencil", "yellow pencil"],
+    "ruler": ["ruler", "measuring ruler"],
+    "eraser": ["eraser", "rubber eraser"],
+    "knife": ["knife"],
+    "stuffed animal": ["teddy bear", "stuffed animal"],
+    "water bottle": ["plastic water bottle", "plastic bottle of water", "insulated metal bottle", "stainless steel water bottle"]
+  },
+  "helpers": {
+    "hand": ["hand", "human hand"],
+    "person": ["person"],
+    "cup": ["cup", "mug"],
+    "book": ["book"],
+    "keyboard": ["keyboard"],
+    "computer mouse": ["computer mouse"],
+    "remote control": ["remote control"],
+    "scissors": ["scissors"],
+    "spoon": ["spoon"],
+    "fork": ["fork"],
+    "baseball": ["baseball"],
+    "baseball bat": ["baseball bat"],
+    "frisbee": ["frisbee"],
+    "ball": ["ball"]
+  },
+  "attributes": {
+    "metal": ["metal water bottle", "stainless steel water bottle"],
+    "plastic": ["plastic water bottle", "disposable plastic water bottle"]
+  }
+}

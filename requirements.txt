@@ -1,5 +1,6 @@
 numpy>=1.24
 mediapipe>=0.10
 opencv-python>=4.8
+onnxruntime>=1.16
 certifi
 pytest>=7
