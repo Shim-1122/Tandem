@@ -111,3 +111,16 @@ def test_gradient_and_hessian_match_finite_differences():
         lm, gm, _ = _loss_grad_hess(th - d, Z, Y, 0.02)
         assert g[i] == pytest.approx((lp - lm) / (2 * eps), abs=1e-7)
         assert H[:, i] == pytest.approx((gp - gm) / (2 * eps), abs=1e-7)
+
+
+def test_calibrations_are_kept_per_emotion_model(tmp_path):
+    EmotionCalibration(1.0, [0.0] * 7, model="hsemotion").save(calibration_path(tmp_path, "shyam"))
+    legacy = calibration_path(tmp_path, "old")
+    d = json.loads(calibration_path(tmp_path, "shyam").read_text())
+    del d["model"]                                          # a file written before the model field existed
+    legacy.write_text(json.dumps(d))
+    assert set(load_all(tmp_path, "hsemotion")) == {"shyam"}
+    assert set(load_all(tmp_path, "opencv")) == {"old"}
+    assert set(load_all(tmp_path)) == {"shyam", "old"}
+    s = CalibrationSession("shyam", 0.0, 1.0, 2.0, model="opencv")
+    assert s.model == "opencv"

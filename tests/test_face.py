@@ -115,7 +115,7 @@ class _Detector:
 
 
 class _Emotion:
-    def logits(self, bgr, landmarks5):
+    def logits(self, bgr, det):
         return np.eye(7)[3] * 30.0
 
 
@@ -186,3 +186,36 @@ def test_emotion_task_waits_for_a_face_before_enrolling():
     t = _task([], _Recognizer())
     t.enroll_request = "me"
     assert t(_Frame(0.0)) is None and t.enroll_request == "me"
+
+
+class _Net:
+    def __init__(self):
+        self.x = None
+
+    def setInput(self, x):
+        self.x = x
+
+    def forward(self):
+        return np.arange(8, dtype=np.float32)[None] * 1.0
+
+
+def test_hsemotion_drops_contempt_and_maps_classes():
+    from vtrack.face import HSEmotionModel
+    m = object.__new__(HSEmotionModel)
+    m.net = _Net()
+    img = np.zeros((480, 640, 3), np.uint8)
+    det = FaceDetection(np.array([300.0, 100.0, 80.0, 100.0]), np.zeros((5, 2)), 0.9, np.zeros(15, np.float32))
+    z = m.logits(img, det)
+    # model classes: anger, contempt, disgust, fear, happiness, neutral, sadness, surprise
+    assert list(z) == [0, 2, 3, 4, 5, 6, 7] and EMOTIONS[2] == "fearful" and z[2] == 3   # fear is model index 3
+    assert m.net.x.shape == (1, 3, 224, 224) and m.net.x.dtype == np.float32
+    assert m.probabilities(img, det).sum() == pytest.approx(1.0)
+
+
+def test_hsemotion_crop_is_square_around_the_face_and_clipped():
+    from vtrack.face import HSEmotionModel
+    img = np.zeros((480, 640, 3), np.uint8)
+    c = HSEmotionModel.crop(img, FaceDetection(np.array([300.0, 100.0, 80.0, 100.0]), None, 0.9))
+    assert c.shape[:2] == (100, 100)                       # side = the longer side of the box
+    c = HSEmotionModel.crop(img, FaceDetection(np.array([-20.0, 400.0, 60.0, 120.0]), None, 0.9))
+    assert c.shape[0] > 0 and c.shape[1] > 0                # partly outside the image: clipped, never empty

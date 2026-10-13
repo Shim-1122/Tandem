@@ -85,6 +85,7 @@ class EmotionCalibration:
     accuracy_after: float = float("nan")         # held-out, calibrated
     frames: int = 0
     created: str = ""
+    model: str = "opencv"                        # emotion model the scores came from (files made before this field: opencv)
 
     def logits(self, z) -> np.ndarray:
         return self.scale * np.asarray(z, dtype=float) + np.asarray(self.bias, dtype=float)
@@ -115,18 +116,24 @@ def calibration_path(faces_dir, name: str) -> Path:
     return Path(faces_dir) / f"{name}.emotion.json"
 
 
-def load_all(faces_dir) -> dict:
-    """{name: EmotionCalibration} for every calibration file in faces_dir (unreadable files are skipped)."""
+def load_all(faces_dir, model: str | None = None) -> dict:
+    """{name: EmotionCalibration} for every calibration file in faces_dir made for `model` (any if None).
+
+    Unreadable files, and calibrations of a different emotion model (their scores mean something else),
+    are skipped.
+    """
     out = {}
     for f in sorted(Path(faces_dir).glob("*.emotion.json")) if Path(faces_dir).exists() else []:
         try:
-            out[f.name[:-len(".emotion.json")]] = EmotionCalibration.load(f)
+            cal = EmotionCalibration.load(f)
         except (ValueError, TypeError, KeyError, json.JSONDecodeError):
             continue
+        if model is None or cal.model == model:
+            out[f.name[:-len(".emotion.json")]] = cal
     return out
 
 
-def calibrate(logits, labels, times) -> EmotionCalibration:
+def calibrate(logits, labels, times, model: str = "hsemotion") -> EmotionCalibration:
     """Fit on all frames; accuracy before/after from fitting the first half of each expression, testing the rest."""
     Z, Y, T = np.asarray(logits, float), np.asarray(labels, int), np.asarray(times, float)
     fit_idx, test_idx = [], []
@@ -140,7 +147,7 @@ def calibrate(logits, labels, times) -> EmotionCalibration:
     before = float(np.mean(np.argmax(Z[test_idx], axis=1) == Y[test_idx]))
     after = float(np.mean(np.argmax(s * Z[test_idx] + b, axis=1) == Y[test_idx]))
     s, b = fit_scale_bias(Z, Y)
-    return EmotionCalibration(s, [float(v) for v in b], before, after, len(Y), time.strftime("%Y-%m-%d %H:%M"))
+    return EmotionCalibration(s, [float(v) for v in b], before, after, len(Y), time.strftime("%Y-%m-%d %H:%M"), model)
 
 
 class CalibrationSession:
@@ -149,8 +156,10 @@ class CalibrationSession:
     Feed every new emotion result with `add(raw logits, capture time)`; when `finished(now)`, call `result()`.
     """
 
-    def __init__(self, name: str, t0: float, prepare_s: float = 1.5, capture_s: float = 2.5, order=CAL_ORDER):
+    def __init__(self, name: str, t0: float, prepare_s: float = 1.5, capture_s: float = 2.5, order=CAL_ORDER,
+                 model: str = "hsemotion"):
         self.name, self.t0, self.prep, self.cap, self.order = name, t0, prepare_s, capture_s, list(order)
+        self.model = model
         self.samples: list[tuple[np.ndarray, int, float]] = []
 
     @property
@@ -193,4 +202,4 @@ class CalibrationSession:
         if short:
             raise ValueError("not enough frames with a face for: " + ", ".join(short))
         Z, Y, T = zip(*self.samples)
-        return calibrate(np.array(Z), np.array(Y), np.array(T))
+        return calibrate(np.array(Z), np.array(Y), np.array(T), self.model)
