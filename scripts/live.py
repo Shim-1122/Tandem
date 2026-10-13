@@ -1,13 +1,16 @@
 """Live tracking: arms, fingers, gestures, head pose, face recognition and emotion, from a webcam.
 
 Body mode (default): seven arm joint angles per arm, finger joints and gestures, 10 joint angles per leg
-and 3 in the core (when they are in view), the head's 6 degrees of freedom, and emotion and face
-recognition, from a webcam that sees you.
+and 3 in the core (when they are in view), the head's 6 degrees of freedom, eye tracking, emotion and face
+recognition, and grasp tracking (objects in view, what each hand holds and the grip force for it), from a
+webcam that sees you.
     python scripts/live.py                              # everything: both arms, hands, legs, core, head, face
     python scripts/live.py --torso desk                 # seated at a desk, hips hidden
     python scripts/live.py --side right                 # one arm only
     python scripts/live.py --gaze-dwell 1.0             # also lock a target by looking at it for 1 s
-POV mode: hands only, for a head-mounted camera (goggles). Hand position and orientation, finger joints.
+    python scripts/live.py --object-model small         # faster object detection for slower computers
+POV mode: hands only, for a head-mounted camera (goggles). Hand position and orientation, finger joints,
+and grasp tracking.
     python scripts/live.py --mode pov --hand right --fov 70
 
 Each model runs in its own thread on the newest camera frame, so hand tracking never waits for the body,
@@ -26,6 +29,7 @@ Keys (click the video window first):
     f  cycle the finger joint table (off, then each tracked hand)
     c  body: print axis and hand/pose agreement checks to the terminal
     w  toggle the wireframe overlay
+    o  show or hide the object boxes
 """
 from __future__ import annotations
 
@@ -65,6 +69,11 @@ def parse_args(argv=None) -> Config:
     ap.add_argument("--no-emotion", action="store_true", help="body mode: turn off emotion and face recognition")
     ap.add_argument("--emotion-model", choices=["hsemotion", "opencv"], default="hsemotion",
                     help="emotion model: hsemotion (default, much better at fear) or opencv (the first one)")
+    ap.add_argument("--no-objects", action="store_true", help="turn off object detection and grasp tracking")
+    ap.add_argument("--object-model", choices=["medium", "small"], default="medium",
+                    help="object detector: medium (default, more accurate) or small (about 3 times faster)")
+    ap.add_argument("--max-grip-n", type=float, default=50.0,
+                    help="the robot hand's strongest grip in newtons; grip commands are force / this (0..1)")
     ap.add_argument("--gaze-dwell", type=float, default=0.0,
                     help="body mode: lock a target by looking at one spot this many seconds (0 = off; "
                          "use key t or a pinch)")
@@ -74,6 +83,8 @@ def parse_args(argv=None) -> Config:
     ap.add_argument("--window-width", type=int, default=1600, help="maximum window width in pixels")
     ap.add_argument("--record", type=Path, help="write per-update values to CSV")
     a = ap.parse_args(argv)
+    if a.max_grip_n <= 0:
+        ap.error("--max-grip-n must be more than 0")
     if a.gaze_dwell < 0:
         ap.error("--gaze-dwell must be 0 or more")
     if not a.name.replace("-", "").replace("_", "").isalnum():
@@ -81,7 +92,8 @@ def parse_args(argv=None) -> Config:
     return Config(mode=a.mode, camera=a.camera, width=a.width, height=a.height, fps=a.fps, side=a.side,
                   torso=a.torso, pose_model=a.pose_model, smoothing=a.smoothing, pose_only_wrist=a.pose_only_wrist,
                   hand=a.hand, swap_hands=a.swap_hands, fov=a.fov, face=not a.no_face, emotion=not a.no_emotion,
-                  emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell,
+                  emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell, objects=not a.no_objects,
+                  object_model=a.object_model, max_grip_n=a.max_grip_n,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
                   record=a.record)
 

@@ -332,3 +332,74 @@ def test_eye_tracking_calibration_and_target_lock_through_the_app(tmp_path):
     last_row = dict(zip(rows[0], rows[-1]))
     assert last_row["target_locked"] == "1" and float(last_row["target_ray_z"]) > 0.5
     assert abs(float(last_row["gaze_x_px"]) - (W - 1 - 300)) < 3
+
+
+class FakeObjects:
+    """Sees a tennis ball wherever the hand is (as if held) and records the zoom regions the app asks for."""
+
+    def __init__(self, box):
+        from vtrack.objects import Detection, Vocabulary
+        v = Vocabulary.load()
+        k = v.index("tennis ball")
+        scores = np.zeros(len(v.names))
+        scores[k] = 0.8
+        self.det = Detection(k, "tennis ball", 0.8, np.asarray(box, float), scores, {"metal": 0.1, "plastic": 0.1})
+        self.rois, self.seen_rois = [], []
+
+    def __call__(self, frame):
+        self.seen_rois.append(list(self.rois))
+        return {"kind": "full", "runs": [(None, [self.det])]}
+
+
+def test_grasp_tracking_through_the_app(tmp_path):
+    models = fake_models()
+    _, _, _, hand_img = scene()
+    px = hand_img[:, :2] * np.array([W, H])
+    box = [*(px.min(axis=0) - 10), *(px.max(axis=0) + 10)]
+    fake = FakeObjects(box)
+    models["objects"] = lambda: fake
+    app = App(Config(cores=8, record=tmp_path / "grasp.csv"), FakeCap(), models)
+    try:
+        last, t0 = 0, time.monotonic()
+        while time.monotonic() - t0 < 1.5:
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            canvas = app.step(f)
+        g = app.grasp["right"]
+        assert g.state == "holding" and g.object_name == "tennis ball" and g.plan.force_n == pytest.approx(1.0)
+        assert app.grasp["left"].state == "free"
+        lines = app.text_lines(time.monotonic())
+        assert any("right: holding tennis ball" in ln for ln in lines) and any(ln.startswith("objects: tennis ball") for ln in lines)
+        rois = [r for r in fake.seen_rois if r]
+        assert rois and rois[-1][0][0] == "right"
+        x0, y0, x1, y1 = rois[-1][0][1]
+        assert x0 < px[:, 0].min() and x1 > px[:, 0].max() and y0 < px[:, 1].min() and y1 > px[:, 1].max()
+        assert canvas.shape[1] <= 1600
+        app.handle_key(ord("o"))
+        assert not app.show_objects
+    finally:
+        app.close()
+    rows = list(csv.reader(open(tmp_path / "grasp.csv", encoding="utf-8")))
+    last_row = dict(zip(rows[0], rows[-1]))
+    assert last_row["R_grasp_state"] == "holding" and last_row["R_grasp_object"] == "tennis ball"
+    assert last_row["R_grip_type"] == "spherical" and float(last_row["R_grip_n"]) == pytest.approx(1.0)
+    assert last_row["L_grasp_state"] == "free" and last_row["objects_seen"].startswith("tennis ball@")
+
+
+def test_grasp_tracking_in_pov_mode(tmp_path):
+    models = fake_models("pov")
+    hand_img = models["hand"]()(None)[0].image
+    px = hand_img[:, :2] * np.array([W, H])
+    models["objects"] = lambda: FakeObjects([*(px.min(axis=0) - 10), *(px.max(axis=0) + 10)])
+    app = App(Config(mode="pov", hand="right", cores=8, record=tmp_path / "pov.csv"), FakeCap(), models)
+    try:
+        last, t0 = 0, time.monotonic()
+        while time.monotonic() - t0 < 1.2:
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            app.step(f)
+        assert app.grasp["right"].state == "holding"
+    finally:
+        app.close()
+    rows = list(csv.reader(open(tmp_path / "pov.csv", encoding="utf-8")))
+    assert dict(zip(rows[0], rows[-1]))["grasp_object"] == "tennis ball"

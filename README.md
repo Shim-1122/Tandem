@@ -1,10 +1,10 @@
 # Homunculus Shadowing
 
-Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, eye tracking with target locking, face recognition and emotion with per-person calibration, from a single webcam.
+Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, eye tracking with target locking, face recognition and emotion with per-person calibration, and grasp tracking (16 everyday objects, what each hand holds, and the grip force the arm should use), from a single webcam.
 
 > **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side only: it tracks a person and produces joint angles and 0..1 joint commands ready for the arm, but nothing here has driven real hardware yet.
 
-Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, gaze and target, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
+Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition; YOLO-World object detection) -> One Euro smoothing -> joint angles, gestures, head pose, gaze and target, emotions, held objects and grip forces -> normalized 0..1 joint commands with limits and slew-rate control.
 
 ## What is here
 
@@ -17,6 +17,10 @@ Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe h
 | `vtrack/gaze.py` | Eye tracking from the iris landmarks, 9-dot gaze calibration onto the video, target locking |
 | `vtrack/face.py` | Face detection, emotion (six cardinal emotions plus neutral, in percent) and face recognition |
 | `vtrack/emotion_cal.py` | Per-person emotion calibration: guided capture, fitted correction, held-out accuracy |
+| `vtrack/objects.py` | Object detection from plain-English names (YOLO-World, ONNX), zoomed search around the hands |
+| `vtrack/grasp.py` | Object tracking with a label vote, which hand holds what, the hand's shape |
+| `vtrack/grip.py` | Grip force per object from physics (weight, friction, tipping, crush limit), every value sourced |
+| `vtrack/clip_text.py` | CLIP text embeddings, only needed to change the list of objects |
 | `vtrack/legs.py` | Legs (hip 4, knee 1, ankle 3, foot 2 DOF each) and core (3 DOF) from the pose landmarks |
 | `vtrack/kinematics.py` | Seven joint angles per arm: shoulder 3 DOF, elbow 1 DOF, wrist 3 DOF, with validity flags |
 | `vtrack/synthetic.py` | Forward kinematics (angles to landmarks and segment frames) for tests, the 3D panel, and a simulated arm |
@@ -29,6 +33,7 @@ Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe h
 | `vtrack/gestures.py` | 16 rule-based hand gestures and a time-based filter that removes flicker |
 | `vtrack/mapping.py` | Angle to 0..1 command mapping and a slew-rate limiter |
 | `scripts/live.py` | Starts the live app from the command line (options listed with `--help`) |
+| `scripts/object_vocab.py` | Rebuilds the object list after editing `vtrack/data/object_prompts.json` |
 | `scripts/eval_stability.py` | Jitter and lag of each smoothing preset on simulated noisy landmarks |
 
 ## Run
@@ -42,12 +47,14 @@ python scripts/live.py --side right                     # one arm only
 python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
 python scripts/live.py --name shyam                     # then press e to enroll your face as shyam
 python scripts/live.py --gaze-dwell 1.0                 # also lock a target by looking at it for 1 second
+python scripts/live.py --object-model small             # faster object detection for slower computers
 ```
 
 Add `--record recordings/run1.csv` to any of these to save every update. Models download into `models/` on
 first run: hand 8 MB, pose 9 MB (full), face mesh 4 MB, face detector 0.2 MB, emotion 16 MB, and the face
-recognition model (38 MB) only when you first enroll your face. On slower computers add `--no-emotion` or
-`--no-face` (see Latency).
+recognition model (38 MB) only when you first enroll your face. The object model is in the repository
+(`vtrack/data`) and is unpacked into `models/` on first run (about a second). On slower computers add
+`--object-model small`, `--no-objects`, `--no-emotion` or `--no-face` (see Latency).
 
 The window has three parts:
 - **Left: the video** (mirrored in body mode, like a mirror) with the landmark wireframe (cyan body, yellow
@@ -89,6 +96,7 @@ Keys (click the video window first):
 | `f` | cycle the finger joint table (off, then each tracked hand) |
 | `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
 | `w` | toggle the wireframe |
+| `o` | show or hide the object boxes |
 
 ## Latency (smooth hand tracking)
 
@@ -138,7 +146,8 @@ the arm joint angles cannot be measured; instead it tracks:
 - hand position relative to the camera in cm (right, down, away), from the hand landmarks and the camera's
   field of view (`--fov`; laptop webcams are about 65 to 78, wide action cameras 110 or more),
 - hand motion and rotation relative to a zero pose you set with `z` (dx, dy, dz; twist, pitch, yaw),
-- flexion at every finger joint (MCP, PIP, DIP) and the gesture.
+- flexion at every finger joint (MCP, PIP, DIP) and the gesture,
+- what the hand holds and the grip force for it (see Grasp tracking); a head camera sees held objects up close.
 
 That relative hand motion is what a robot's end effector would follow during teleoperation. Two limits:
 depth assumes an average-size hand (a bigger hand reads farther away), and because the camera moves with
@@ -243,6 +252,130 @@ can make the iris harder to find.
 
 Recorded as `eyes_open`, `eye_yaw`, `eye_pitch`, `gaze_x_px`, `gaze_y_px` (camera pixels), `target_locked`,
 `target_x_px`, `target_y_px` and `target_ray_x`, `target_ray_y`, `target_ray_z`.
+
+## Grasp tracking: objects, what each hand holds, and the grip force
+
+> These grip forces are targets for the planned arm, worked out from physics, not measured on a hand. Check them
+> with a force sensor once the hand is built and edit `vtrack/grip.py`.
+
+**Objects.** Sixteen objects are recognized: tennis ball, ping pong ball, soccer ball, basketball, American
+football, tennis racket, ping pong paddle, cell phone, pen, pencil, ruler, eraser, knife, stuffed animal, and
+water bottles (metal or plastic). The detector is YOLO-World v2 (medium size), which finds objects named in
+plain English: each object is a few phrasings ("teddy bear", "stuffed animal") turned into CLIP text
+embeddings, so the list is data, not part of the model (`vtrack/data/object_prompts.json`). A few extra
+"helper" classes (hand, person, cup, mouse, remote...) are detected only so that they are not mistaken for one
+of the sixteen.
+
+It runs in its own low-priority thread, like the face models, and alternates: the whole frame every 0.6
+seconds (to find objects anywhere), and in between only a zoomed square around each hand, where a held object
+is seen large enough to recognize. Each object is tracked from run to run with a running score for every
+class, so its label is a vote over many frames rather than one guess, and a held object moves along with the
+hand between detections (the hand hides much of it). The video shows a box and label for each object; a held
+one is drawn in its hand's color with the grip to use.
+
+**Grasps.** A hand holds an object when its thumb tip and at least one other finger touch the object's box
+for a quarter of a second (or the palm, for objects bigger than the hand). It lets go when the hand opens,
+when the object is seen away from the hand, or when the hand is out of view for more than 0.6 seconds. The
+readout shows each hand (`grasp right: holding tennis ball | spherical grip 1.0 N (0.02)`), the hand's
+shape (open, pinch, tripod, wrap or fist) and the objects in view. The camera sees no depth at the contact, so a
+hand passing in front of an object can look like a touch; the time threshold and the hand's shape (an open hand
+never holds anything) filter most of that out.
+
+**Grip force.** For each object, `vtrack/grip.py` works out the squeeze that holds it with a safety margin:
+
+```
+F_slip   = m (g + a) / (n mu)        friction on the opposing contacts carries the weight while moving
+F_tip    = m (g + a) lever / span    a long object held off center (racket, knife) tips about the grip
+F_target = safety (F_slip + F_tip),  at least 1 N, at most what the object tolerates
+command  = F_target / 50 N           (0..1; set the hand's real strongest grip with --max-grip-n)
+```
+
+`m` is the heaviest typical mass, `a` = 3 m/s² of arm motion, `n` = 2 for fingertip grasps and 3 for
+whole-hand wraps, `mu` the friction between rubber-like fingertip pads and the object (conservative: silicone
+pads on smooth plastic measured 0.3 to 1.7, lower at higher squeeze, Leddy and Dollar 2020), and safety = 2
+(3 for knives). People hold still objects with 40 to 50% of their grip force above the slip force, about 1.7 to
+2 times it (Hiramatsu et al. 2015, PLOS ONE), so 2 is not generous for a robot with less touch feedback.
+
+| Object | Grasp | Mass used | Friction | Grip force | Command (of 50 N) | Do not exceed | Open hand to |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| tennis ball | spherical | 59 g | 0.6 | 1.0 N | 0.02 | - | 9 cm |
+| ping pong ball | fingertip pinch | 3 g | 0.4 | 1.0 N | 0.02 | 20 N | 6 cm |
+| soccer ball | spherical | 450 g | 0.6 | 6.4 N | 0.13 | - | 24 cm |
+| basketball | spherical | 650 g | 0.7 | 7.9 N | 0.16 | - | 26 cm |
+| american football | power wrap | 430 g | 0.7 | 5.2 N | 0.10 | - | 19 cm |
+| tennis racket | power wrap | 340 g | 0.7 | 32.5 N | 0.65 | - | 5 cm |
+| ping pong paddle | power wrap | 200 g | 0.5 | 10.2 N | 0.20 | - | 5 cm |
+| cell phone | power wrap | 240 g | 0.4 | 5.1 N | 0.10 | 30 N | 10 cm |
+| pen | tripod (pen grip) | 20 g | 0.4 | 1.0 N | 0.02 | 30 N | 3 cm |
+| pencil | tripod (pen grip) | 8 g | 0.5 | 1.0 N | 0.02 | 40 N | 3 cm |
+| ruler | lateral pinch | 70 g | 0.4 | 4.0 N | 0.08 | 30 N | 2 cm |
+| eraser | fingertip pinch | 30 g | 0.8 | 1.0 N | 0.02 | 15 N | 4 cm |
+| knife | power wrap | 250 g | 0.5 | 11.2 N | 0.22 | - | 4 cm |
+| stuffed animal | power wrap | 500 g | 0.6 | 7.1 N | 0.14 | 15 N | 17 cm |
+| plastic water bottle (500 ml, full) | power wrap | 550 g | 0.5 | 9.4 N | 0.19 | 15 N | 8 cm |
+| metal water bottle (insulated, full) | power wrap | 1.2 kg | 0.4 | 25.6 N | 0.51 | - | 10 cm |
+| water bottle, material unsure | power wrap | 1.2 kg | 0.4 | 15.0 N | 0.30 | 15 N | 10 cm |
+
+Masses for the balls come from their rules (ITF, ITTF, IFAB Laws of the Game, FIBA, NFL); the rest are typical
+retail values, so weigh yours. Notes worth knowing: the tennis racket needs the most because it is held level by
+the end of its handle (held head up it needs about 4 N); a ping pong ball weighs almost nothing, so the 1 N floor
+sets its force, and the ITTF hardness test presses it with 50 N, so 20 N is a wide margin; a phone's side buttons
+take only a few newtons, so squeeze across its front and back; an open plastic bottle dents and spills when
+squeezed; the knife is for holding and moving, by the handle, not for cutting. Every entry, its sources and its
+notes are in `vtrack/grip.py`.
+
+**Bottle material.** The detector also scores "metal water bottle" against "plastic water bottle" phrasings.
+It leans toward "metal" for every bottle, so the bottle counts as metal only when that score is far ahead (on
+labeled photos insulated bottles were 5 of 6 metal, 1 unsure; ordinary water bottles 33 plastic, 41 unsure, 8
+metal). When unsure, the grip is the metal bottle's force held to the plastic bottle's limit (15 N): a full
+metal bottle could then slip if moved fast, which is the safer mistake.
+
+**Accuracy.** Measured on real photos with labeled objects (LVIS v1 validation set, which labels everyday
+objects in COCO photos; objects at least 24 pixels across). "Found" counts an object when a box with the right
+label overlaps it (intersection over union 0.5 or more); "false" is how often the label appears in photos
+verified not to contain it; "in a hand" crops a square around a hand holding the object (from COCO's wrist
+keypoints, crops at least 150 pixels wide), like the app's zoomed search, and checks the top label on it.
+
+| Object | Objects | Found: medium | Found: small | False per photo (medium) | In a hand: medium | In a hand: small |
+| --- | --- | --- | --- | --- | --- | --- |
+| tennis ball | 34 | 74% | 65% | 0.00 | 67% of 15 | 53% |
+| soccer ball | 57 | 95% | 82% | 0.05 | 1 of 1 | 1 of 1 |
+| basketball | 7 | 43% | 14% | 0.06 | - | - |
+| american football | 7 | 29% | 43% | 0.00 | - | - |
+| tennis racket | 186 | 83% | 74% | 0.00 | 75% of 8 | 50% |
+| cell phone | 133 | 83% | 77% | 0.03 | 95% of 41 | 85% |
+| pen | 79 | 42% | 13% | 0.00 | 3 of 5 | 1 of 5 |
+| pencil | 37 | 43% | 27% | 0.03 | 0 of 1 | 0 of 1 |
+| eraser | 7 | 0% | 0% | 0.03 | - | - |
+| knife | 162 | 51% | 32% | 0.00 | 46% of 39 | 18% |
+| stuffed animal (teddy bear) | 188 | 79% | 70% | 0.11 | 77% of 26 | 85% |
+| water bottle | 101 | 81% | 78% | 0.33 | 73% of 11 | 82% |
+| insulated bottle | 7 | 86% | 71% | 0.18 | 1 of 1 | 1 of 1 |
+| **average** | | **61%** | **50%** | **0.06** | **72% of 148** | **59% of 148** |
+
+What this means: phones, rackets, balls, stuffed animals and bottles are found reliably; knives, pens and pencils
+about half the time per frame (the vote over many frames helps); erasers in these photos were tiny and never
+found; and there were no labeled photos of ping pong balls, ping pong paddles or rulers, so those three are
+untested. Ball types can be mixed up: an American football is often called a soccer ball. The phrasings were
+chosen on this same data (for example "football" in a phrasing made every ball read as an American football and
+was removed), so treat the numbers as optimistic. On a webcam the objects you hold are closer and larger than in
+these photos, which helps.
+
+Speed on a slow 2-core test computer: medium 394 ms for the whole frame and 125 ms per hand crop, small 169 and
+52 ms. Use `--object-model small` (2 to 3 times faster, about 10 to 13 points less accurate) if the status line shows the
+objects model below 2 Hz, or `--no-objects` to turn it off.
+
+**Your own objects.** Add a line to `vtrack/data/object_prompts.json` (a name and a few phrasings), run
+`python scripts/object_vocab.py` (downloads the CLIP text encoder once, 254 MB, MIT license), and add an
+`ObjectSpec` with its mass, size, grasp and friction to `OBJECTS` in `vtrack/grip.py` to give it a grip force.
+
+Recorded per hand (`L_` and `R_` with both arms): `grasp_state` (free, touching, holding), `grasp_object`,
+`hand_shape`, `grip_type`, `grip_n`, `grip_cmd`, `grip_open_cm`, and `objects_seen` (label@track id).
+
+The detector weights are Ultralytics' YOLO-World v2 (AGPL-3.0 license), exported to ONNX here with the class
+embeddings as an input and stored in half precision (`vtrack/data`; any score changes by 0.03 at most). That is
+fine in this private repository; publishing the repository or shipping it in a product would bring in the
+AGPL's terms.
 
 ## Face recognition and emotion
 
@@ -458,6 +591,8 @@ reported with the wrist because the hand's orientation is what shows them.
    tracker reads your face in your lighting.
 8. **Eyes.** Press `g` and follow the dots, then look at a few things in the video: the cyan circle should
    follow your eyes within the accuracy the calibration reported. Lock one with `t` and check the red box.
+9. **Grasps.** Hold each object up to the camera, then pick it up: the box should get the right label within a
+   second or two, and the readout should say which hand holds it. Note which objects your camera misses.
 
 Expect the largest errors in shoulder rotation and forearm rotation: they come from small differences between
 noisy landmarks, and a few centimeters of elbow or wrist error is several degrees over a 25 to 30 cm segment.
@@ -472,15 +607,21 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - Recording columns: per arm the gesture, the seven angles, flags and 21 finger angles (`L_` and `R_` prefixes with
   `--side both`); per leg the ten leg angles and the hip rotation source (`L_` and `R_`), the three core angles and
   `leg_up_source`; then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
-  `identity`, `match` and `emotion_calibrated_for`, then the eye and target columns (see Eyes). A row is written whenever any model delivers a new result.
-- Tested: 183 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
+  `identity`, `match` and `emotion_calibrated_for`, then the eye and target columns (see Eyes) and the grasp
+  columns (see Grasp tracking). A row is written whenever any model delivers a new result.
+- Tested: 215 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
   and the core (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted
   camera, PnP hand position recovery, all gestures in random orientations for both hands, head pose round trips,
   eye angles and gaze points (exact for random head poses), gaze calibration that survives head motion, target
   locking, emotion alignment against an independent least-squares solution, the emotion calibration fit (gradient
-  checked, recovers known corrections), the threaded pipeline, and the whole app with simulated models, including
-  a full emotion calibration and a full gaze calibration followed by locking a target with a key and with pinches.
-  The app was also run headless with the real models on photos (body, both arms, hidden elbows, a full-body yoga
-  pose, POV with thumbs up, peace, pointing and open hands; the eyes of a portrait looking into the camera read
-  yaw 0 and pitch 5 degrees, and a gaze calibration on a still photo was correctly refused). Not tested here:
+  checked, recovers known corrections), object detector decoding with known boxes in the whole frame and in zoomed
+  regions, unpacking the stored models (checksum, sizes), the grip force formula and its limits, object tracking
+  (label vote, aging, carrying), the grasp state machine (touch, hold, carry, release, hidden object), the
+  threaded pipeline, and the whole app with simulated models, including a full emotion calibration, a full gaze
+  calibration followed by locking a target with a key and with pinches, and holding an object in body and POV
+  modes. The app was also run headless with the real models on photos (body, both arms, hidden elbows, a full-body
+  yoga pose, POV with thumbs up, peace, pointing and open hands; the eyes of a portrait looking into the camera
+  read yaw 0 and pitch 5 degrees, and a gaze calibration on a still photo was correctly refused; a woman holding
+  up a phone read as her left hand holding a cell phone, grip 5.1 N, and in POV mode a phone held in both hands
+  read as held). The object detector was measured on labeled photos (see Grasp tracking). Not tested here:
   accuracy with a real camera on your setup. Use the checks above.

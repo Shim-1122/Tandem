@@ -22,6 +22,8 @@ from .filters import HAND_SMOOTHING, AngleSmoother, JitterMeter, LandmarkSmoothe
 from .gaze import GazeCalibrationSession, TargetLock, calibration_targets, eye_state
 from .fingers import FINGER_KEYS, THUMB_KEYS, HandKinematics, flat, hand_fk, hand_geometry, palm_to_world
 from .gestures import Gesture, GestureFilter, classify_hand
+from .grasp import GraspState, GraspTracker, ObjectTracker, hand_points, hand_roi, hand_shape
+from .grip import GripModel
 from .handpose import HandPoseZero, camera_matrix, hand_frame, hand_pose_camera
 from .head import HeadPoseEstimator, HeadPoseZero, angles_from_axes, head_axes_from_angles
 from .legs import (CAMERA_UP, CORE_FIELDS, LEG_FIELDS, CoreAngles, LegAngles, LegKinematics, core_angles,
@@ -43,6 +45,7 @@ LEG_LABELS = {"hip_flexion": "Hip flex/ext", "hip_abduction": "Hip abd/add", "hi
               "foot_roll": "Foot roll"}
 CORE_LABELS = {"core_flexion": "Core flex/ext", "core_lateral_bend": "Core side bend", "core_rotation": "Core rotation"}
 FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+GRASP_COLS = ["grasp_state", "grasp_object", "hand_shape", "grip_type", "grip_n", "grip_cmd", "grip_open_cm"]
 FINGER_COLS = [f"{f}_{k}" for f in ["index", "middle", "ring", "pinky"] for k in FINGER_KEYS] + \
               [f"thumb_{k}" for k in THUMB_KEYS]
 VIS = 0.6
@@ -75,6 +78,12 @@ class Config:
     gaze_dwell: float = 0.0            # > 0: also lock a target by holding your gaze still this many seconds
     gaze_settle_s: float = 1.0         # gaze calibration: seconds to look at each dot before recording
     gaze_capture_s: float = 1.2        #   and seconds recorded per dot
+    objects: bool = True               # object detection and grasp tracking
+    object_model: str = "medium"       # medium | small (about 3 times faster, less accurate)
+    object_hz: float = 10.0            # object model: at most this often
+    object_min_hz: float = 2.0         #   and at least this often when the CPU is busy
+    object_every_s: float = 0.6        # search the whole frame this often; otherwise only around the hands
+    max_grip_n: float = 50.0           # the robot hand's strongest grip (scales the 0..1 grip command)
     cores: int | None = None           # CPU cores to plan for (default: all)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
@@ -135,6 +144,13 @@ def default_models(cfg: Config, size):
             makers["face"] = face
         if cfg.emotion:
             makers["emotion"] = lambda: EmotionTask(cfg.model_dir, cfg.faces_dir, model=cfg.emotion_model)
+    if cfg.objects:
+        def objects():
+            from .objects import ObjectTask
+            import os
+            threads = max(1, min(4, (cfg.cores or os.cpu_count() or 2) - 2))   # leave cores for hands and body
+            return ObjectTask(cfg.object_model, cfg.model_dir, cfg.object_every_s, threads=threads)
+        makers["objects"] = objects
     return makers
 
 
@@ -178,8 +194,8 @@ class App:
         # free, with a guaranteed minimum rate (see pipeline.py), and are capped so they never need more.
         priority = [n for n in self.fns if n in ("hand", "pose")]
         self.gate = BackgroundGate(len(priority), cfg.cores)
-        caps = {"face": cfg.face_hz, "emotion": cfg.emotion_hz}
-        floors = {"face": cfg.face_min_hz, "emotion": cfg.emotion_min_hz}
+        caps = {"face": cfg.face_hz, "emotion": cfg.emotion_hz, "objects": cfg.object_hz}
+        floors = {"face": cfg.face_min_hz, "emotion": cfg.emotion_min_hz, "objects": cfg.object_min_hz}
         self.workers = {name: ModelWorker(name, self.camera, fn, max_hz=caps.get(name) or None,
                                           gate=None if name in priority else self.gate,
                                           min_hz=floors.get(name, 5.0))
@@ -229,6 +245,15 @@ class App:
         self.emo_smooth = EmotionSmoother()
         self.calibrations = load_all(cfg.faces_dir, cfg.emotion_model) if cfg.emotion else {}
         self.cal_session, self.cal_person = None, None
+        # objects and grasps (vocabulary from the object model, or the repository's when the model is faked)
+        vocab = getattr(getattr(self.fns.get("objects"), "det", None), "vocab", None)
+        if vocab is None:
+            from .objects import Vocabulary
+            vocab = Vocabulary.load()
+        self.obj_tracker = ObjectTracker(vocab.names, vocab.report)
+        self.grasps = GraspTracker(GripModel(arm_max_n=cfg.max_grip_n))
+        self.grasp = {sd: GraspState(sd) for sd in hand_sides}
+        self.show_objects = True
         # pov state
         self.pov_zero, self.pov_info = HandPoseZero(), None
         # ui state
@@ -260,7 +285,10 @@ class App:
 
     def update(self) -> bool:
         """Consume new worker results; True when any arrived."""
-        hand_r, pose_r, face_r, emo_r = (self._new(n) for n in ("hand", "pose", "face", "emotion"))
+        hand_r, pose_r, face_r, emo_r, obj_r = (self._new(n) for n in ("hand", "pose", "face", "emotion", "objects"))
+        if obj_r is not None:
+            for region, dets in obj_r.value["runs"]:
+                self.obj_tracker.update(dets, obj_r.t_capture, region=region)
         if pose_r is not None:
             self.pose_res = pose_r
             if pose_r.value is not None:
@@ -292,7 +320,7 @@ class App:
         if getattr(task, "message", ""):
             self.say(task.message)
             task.message = ""
-        new = [r for r in (hand_r, pose_r, face_r, emo_r) if r is not None]
+        new = [r for r in (hand_r, pose_r, face_r, emo_r, obj_r) if r is not None]
         if new:
             self.data_t = max([r.t_capture for r in new] + ([self.data_t] if self.data_t is not None else []))
         return bool(new)
@@ -308,18 +336,26 @@ class App:
             else:
                 both = len(self.sides) == 2          # then a lone hand must carry its own label
                 chosen = {sd: pick_hand_by_label(hands, sd, fallback=not both) for sd in self.sides}
+        rois = []
         for sd, hand in chosen.items():
             if hand is None:
                 self.hands_w.pop(sd, None)
                 self.hands_raw.pop(sd, None)
                 self.fingers.pop(sd, None)
                 self.gestures[sd] = self.gfilters[sd].update(Gesture.UNKNOWN, r.t_capture).value
+                self.grasp[sd] = self.grasps.update(sd, None, "", self.obj_tracker, r.t_capture)
                 continue
             w = self.hand_smooths[sd](hand.world, r.t_capture)
             self.hands_w[sd], self.hands_raw[sd] = w, hand
             self.gestures[sd] = self.gfilters[sd].update(classify_hand(w), r.t_capture).value
             self.fingers[sd] = self.hand_kins[sd].solve(w)
             self.finger_geo[sd] = hand_geometry(w, sd)
+            px = hand_points(hand.image, *self.size)
+            self.grasp[sd] = self.grasps.update(sd, px, hand_shape(w, self.fingers[sd]), self.obj_tracker, r.t_capture)
+            rois.append((sd, hand_roi(px, *self.size)))
+        task = self.fns.get("objects")
+        if task is not None:
+            task.rois = rois                        # the object model zooms in on the hands next
         if not self.pov:                            # a new pinch (either hand) locks or releases the target
             for sd, g in self.gestures.items():
                 if g == Gesture.PINCH.value and self.prev_gestures.get(sd) != Gesture.PINCH.value:
@@ -589,6 +625,7 @@ class App:
             else:
                 lines.append(f"no {sd} hand in view")
             lines.append(f"gesture: {self.gestures[sd]}")
+            lines += self.grasp_lines()
         else:
             lines += self.body_table()
             if self.pose_res is None or self.pose_res.value is None:
@@ -608,12 +645,13 @@ class App:
             lines.append(f"torso up: {self.torso_src}   legs up: {self.leg_up_src}"
                          + ("   (z: calibrate)" if "camera vertical" in (self.torso_src, self.leg_up_src) else ""))
             lines.append("gesture: " + "  ".join(f"{sd} {self.gestures[sd]}" for sd in self.sides))
+            lines += self.grasp_lines()
             lines.append(self.gaze_line())
         if self.message and now - self.message_t < 4.0:
             lines.append(self.message)
         lines.append(self.status_line(now))
-        keys = "q quit  w wire  f fingers  " + ("z zero hand" if self.pov else
-                                                  "z calibrate  h head zero  e enroll  k emotion cal  g gaze cal  t lock  c checks")
+        keys = "q quit  w wire  f fingers  o objects  " + ("z zero hand" if self.pov else
+                                                             "z calibrate  h head zero  e enroll  k emotion cal  g gaze cal  t lock  c checks")
         lines.append(keys)
         return lines
 
@@ -658,6 +696,15 @@ class App:
         left_rows += [["", "", ""]] * (n - len(left_rows))
         right_rows += [["", "", ""]] * (n - len(right_rows))
         return ["\tL\tR\t\tL\tR"] + ["\t".join(a + b) for a, b in zip(left_rows, right_rows)]
+
+    def grasp_lines(self):
+        """One line per hand (what it holds and the grip for it) and the objects in view."""
+        if "objects" not in self.workers:
+            return ["grasp: off (--no-objects)"]
+        lines = ["grasp " + g.text() for g in self.grasp.values()]
+        seen = [tr.label for tr in self.obj_tracker.confirmed()]
+        lines.append("objects: " + (", ".join(seen[:6]) + (f" (+{len(seen) - 6})" if len(seen) > 6 else "") if seen else "none"))
+        return lines
 
     def gaze_line(self):
         e = self.eye
@@ -737,6 +784,8 @@ class App:
         if self.gaze_session is not None:              # dots only: nothing else on the video to look at
             self._draw_gaze_calibration(video, now)
         else:
+            if self.show_objects:
+                self._draw_objects(video)
             _, h1 = text_block(video, self.text_lines(now), align=None if self.pov else "lrrlrr")
             text_block(video, self.finger_lines(), origin=(0, h1 + 4))
             self._draw_gaze(video, now)
@@ -804,6 +853,26 @@ class App:
                 cv2.line(img, (x + 12 * dx, y + 12 * dy), (x + 40 * dx, y + 40 * dy), red, 2, cv2.LINE_AA)
             cv2.putText(img, "LOCKED", (x - 28, y - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, red, 2, cv2.LINE_AA)
 
+    def _draw_objects(self, img):
+        """Object boxes on the video as displayed; a held object in its hand's color with the grip to use."""
+        cv2 = self.cv2
+        w = img.shape[1]
+        holder = {g.object_id: g for g in self.grasp.values() if g.state == "holding"}
+        colors = {"right": (255, 255, 0), "left": (203, 112, 255)}
+        for tr in self.obj_tracker.confirmed():
+            x0, y0, x1, y1 = tr.box
+            if not self.pov:                            # the video is mirrored
+                x0, x1 = w - 1 - x1, w - 1 - x0
+            p0, p1 = (int(x0), int(y0)), (int(x1), int(y1))
+            g = holder.get(tr.id)
+            color = colors[g.side] if g else (230, 230, 230)
+            cv2.rectangle(img, p0, p1, color, 3 if g else 1, cv2.LINE_AA)
+            text = f"{tr.label} {tr.score:.2f}"
+            if g is not None and g.plan is not None:
+                text += f"  grip {g.plan.force_n:.1f} N"
+            cv2.putText(img, text, (p0[0], max(14, p0[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(img, text, (p0[0], max(14, p0[1] - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+
     def gaze_in_torso(self):
         """Gaze direction in the torso frame (for the 3D panel), when the eyes and the torso are known."""
         e = self.eye
@@ -853,6 +922,8 @@ class App:
                 self.say(f"gaze calibration: look at each dot ({self.gaze_session.duration:.0f} s)")
         elif k == "t":
             self._toggle_target("key t")
+        elif k == "o":
+            self.show_objects = not self.show_objects
         elif k == "e":
             task = self.fns.get("emotion")
             if task is None:
@@ -869,6 +940,7 @@ class App:
         self.writer = csv.writer(self._csv_file)
         if self.pov:
             cols = ["t", "gesture", "x_m", "y_m", "z_m", "dx_cm", "dy_cm", "dz_cm", "twist", "pitch", "yaw"] + FINGER_COLS
+            cols += GRASP_COLS + ["objects_seen"]
         else:
             cols = ["t"]
             for sd in self.sides:
@@ -883,7 +955,22 @@ class App:
                      "neck_yaw", "neck_pitch", "neck_roll", *[f"emotion_{e}_pct" for e in EMOTIONS], "identity", "match",
                      "emotion_calibrated_for", "eyes_open", "eye_yaw", "eye_pitch", "gaze_x_px", "gaze_y_px",
                      "target_locked", "target_x_px", "target_y_px", "target_ray_x", "target_ray_y", "target_ray_z"]
+            for sd in self.sides:
+                p = sd[0].upper() + "_" if len(self.sides) > 1 else ""
+                cols += [p + c for c in GRASP_COLS]
+            cols.append("objects_seen")
         self.writer.writerow(cols)
+
+    def grasp_row(self, sd):
+        nan = float("nan")
+        g = self.grasp.get(sd) or GraspState(sd)
+        pl = g.plan if g.state == "holding" else None
+        return [g.state, g.object_name if g.state != "free" else "", g.shape, pl.grasp if pl else "",
+                round(pl.force_n, 2) if pl else nan, round(pl.command, 3) if pl else nan,
+                round(100 * pl.open_m, 1) if pl else nan]
+
+    def objects_seen(self):
+        return ";".join(f"{tr.label}@{tr.id}" for tr in self.obj_tracker.confirmed())
 
     def write_row(self, t):
         if self.writer is None:
@@ -898,7 +985,8 @@ class App:
             fv = flat(self.fingers[sd]) if sd in self.fingers else {}
             self.writer.writerow([f"{t:.3f}", self.gestures[sd], *np.round(info["t"], 4),
                                   *([round(v, 2) for v in (rel.dx_cm, rel.dy_cm, rel.dz_cm, rel.twist, rel.pitch, rel.yaw)]
-                                    if rel else [nan] * 6), *[round(fv.get(c, nan), 1) for c in FINGER_COLS]])
+                                    if rel else [nan] * 6), *[round(fv.get(c, nan), 1) for c in FINGER_COLS],
+                                  *self.grasp_row(sd), self.objects_seen()])
             return
         row = [f"{t:.3f}"]
         for sd in self.sides:
@@ -924,6 +1012,9 @@ class App:
         row += [int(bool(e and e.valid)), *([round(e.yaw, 2), round(e.pitch, 2)] if e and e.valid else [nan, nan]),
                 *(np.round(g, 1) if g is not None else [nan, nan]), int(self.target.locked),
                 *(np.round(tp, 1) if tp is not None else [nan, nan]), *(np.round(ray, 4) if ray is not None else [nan] * 3)]
+        for sd in self.sides:
+            row += self.grasp_row(sd)
+        row.append(self.objects_seen())
         self.writer.writerow(row)
 
     # ------------------------------------------------------------------ loop
