@@ -1,6 +1,8 @@
 # Homunculus Shadowing
 
-Camera-based body tracking so the Homunculus pneumatic arm can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, face recognition and emotion with per-person calibration, from a single webcam.
+Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, face recognition and emotion with per-person calibration, from a single webcam.
+
+> **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side only: it tracks a person and produces joint angles and 0..1 joint commands ready for the arm, but nothing here has driven real hardware yet. It has been tested with automated tests, simulated motion and photos, not yet with a live webcam on the final setup.
 
 Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
 
@@ -417,7 +419,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - `--side` is the person's own arm. In body mode a hand is matched to that arm by image position, not by MediaPipe's left/right label.
 - One RGB camera gives estimated depth, so angles are most reliable when the arm moves across the camera view.
 - The command mapping stops at 0..1 per joint. Mapping to air muscle pressure needs a calibration curve per muscle.
-- The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once its axes are decided.
+- The shoulder angle order (Z-X-Y) should match the physical Homunculus shoulder once the arm is built and its axes are decided.
 - Recording columns: per arm the gesture, the seven angles, flags and 21 finger angles (`L_` and `R_` prefixes with
   `--side both`); per leg the ten leg angles and the hip rotation source (`L_` and `R_`), the three core angles and
   `leg_up_source`; then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
