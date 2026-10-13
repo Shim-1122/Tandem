@@ -70,7 +70,7 @@ def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-2
 
 
 def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", fingers_by_side=None,
-                      head_axes=None, legs_by_side=None, core=None):
+                      head_axes=None, legs_by_side=None, core=None, full_body=False):
     """3D view of the body rebuilt from solved angles. Returns a BGR image.
 
     angles_by_side: {"right": ArmAngles or dict, "left": ...}; either side may be omitted or all NaN.
@@ -82,6 +82,8 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
     legs_by_side: optional {side: LegAngles or dict} and core: optional CoreAngles or dict (legs.py). When a
     leg is given the view zooms out to the whole body standing on the pelvis: the pelvis tilts with the
     pelvic hike, the chest turns on it by the core angles, and the legs hang from it.
+    full_body: always draw the whole body (both arms, both legs, pelvis, core, head); parts that are not in
+    view are drawn grey in a neutral pose (arms and legs straight down, head facing forward).
     Drawn as a mirror view (your right side on the right), matching the mirrored video. Small
     red/green/blue axes show each segment's frame: upper arm at the elbow, forearm at the wrist,
     hand at the knuckles, thigh at the knee, foot at the ankle.
@@ -104,12 +106,15 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         if v is not None and all(np.isfinite(v[k]) for k in ("hip_flexion", "hip_abduction", "hip_rotation",
                                                              "knee_flexion")):
             legs[side] = v
-    full = bool(legs)
+    full = bool(legs) or full_body
+    ghost_legs = [sd for sd in ("left", "right") if full_body and sd not in legs]
+    for sd in ghost_legs:                                # not in view: neutral, drawn grey
+        legs[sd] = {k: 0.0 for k in LEG_FIELDS}
     if full:
         cv = get_all(core, ["core_flexion", "core_lateral_bend", "core_rotation"]) or {}
         R_core = core_rotation_matrix({k: (x if np.isfinite(x) else 0.0) for k, x in cv.items()})
         hikes = [legs[sd]["pelvic_hike"] * (1 if sd == "right" else -1) for sd in legs
-                 if np.isfinite(legs[sd]["pelvic_hike"])]
+                 if sd not in ghost_legs and np.isfinite(legs[sd]["pelvic_hike"])]
         R_tilt = rot_x(-math.radians(hikes[0])) if hikes else np.eye(3)
         R_base = R_tilt @ R_core                       # chest axes in the drawing
         shift = np.array([0.0, 0.5, 0.0])               # chest origin (shoulder midpoint) above the hips
@@ -160,6 +165,10 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         hip = np.array([0.0, 0.0, 0.1])
         P = {k: (hip + c[k]) * mirror for k in ("H", "K", "A", "heel", "toe")}
         h, k, a, hl, t = prp(P["H"], P["K"], P["A"], P["heel"], P["toe"])
+        if side in ghost_legs:
+            for p1, p2 in ((h, k), (k, a), (a, hl), (hl, t), (t, a)):
+                cv2.line(img, p1, p2, (70, 70, 70), 2, cv2.LINE_AA)
+            continue
         col = ARM_COLORS[side]
         cv2.line(img, h, k, col, 4, cv2.LINE_AA)
         cv2.line(img, k, a, col, 4, cv2.LINE_AA)
@@ -177,12 +186,19 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
                 cv2.arrowedLine(img, a1, b1, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
 
     drawn = 0
-    for side, angles in angles_by_side.items():
-        if angles is None:
-            continue
-        get = (lambda k: angles[k]) if isinstance(angles, dict) else (lambda k: getattr(angles, k))
-        vals = {k: get(k) for k in KEYS}
-        if any(not np.isfinite(vals[k]) for k in KEYS[:4]):
+    for side in (["left", "right"] if full_body else list(angles_by_side)):
+        angles = angles_by_side.get(side)
+        vals = None
+        if angles is not None:
+            get = (lambda k: angles[k]) if isinstance(angles, dict) else (lambda k: getattr(angles, k))
+            vals = {k: get(k) for k in KEYS}
+        if vals is None or any(not np.isfinite(vals[k]) for k in KEYS[:4]):
+            if full_body:                                # not in view: arm hanging straight, grey
+                c = arm_chain({k: 0.0 for k in KEYS})               # elbow 0: straight
+                mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
+                s_, e, w, k = pr(c["S"] * mirror, c["E"] * mirror, c["W"] * mirror, c["K"] * mirror)
+                for p1, p2 in ((s_, e), (e, w), (w, k)):
+                    cv2.line(img, p1, p2, (70, 70, 70), 2, cv2.LINE_AA)
             continue
         drawn += 1
         wrist_ok = all(np.isfinite(vals[k]) for k in KEYS[4:])
@@ -216,6 +232,10 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
             for i in range(3):
                 a, b = pr(origin, origin + 0.08 * R[:, i])
                 cv2.arrowedLine(img, a, b, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
+    if head_axes is None and full_body:                  # no face in view: neutral head outline
+        c = pr(np.array([0.0, 0.24, 0.0]), np.array([0.0, 0.0, 0.0]))
+        cv2.line(img, c[1], c[0], (70, 70, 70), 2, cv2.LINE_AA)
+        cv2.circle(img, c[0], int(0.13 * scale), (70, 70, 70), 1, cv2.LINE_AA)
     if head_axes is not None:
         from .head import HEAD_AXES_IN_MODEL, MODEL_POINTS_M
         head_c = np.array([0.0, 0.24, 0.0])
@@ -234,6 +254,8 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
     if drawn == 0 and not full:
         cv2.putText(img, "no arm pose", (20, size // 2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
     cv2.putText(img, "solved kinematics (mirror view)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
+    if full_body:
+        cv2.putText(img, "grey: not in view", (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.42, GREY, 1)
     if note:
         cv2.putText(img, note, (10, size - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.5, YELLOW, 1)
     return img
@@ -274,12 +296,13 @@ def render_hand_panel(world, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", 
     return img
 
 
-def text_block(img, lines, scale=None, color=GREEN, origin=(0, 0), alpha=0.55):
+def text_block(img, lines, scale=None, color=GREEN, origin=(0, 0), alpha=0.55, align=None):
     """Draw lines of text on a semi-transparent dark box (top-left corner at `origin`), in place.
 
-    A line containing tab characters is drawn as columns: the first cell left aligned, later cells
-    right aligned at fixed positions, so numbers line up even with OpenCV's proportional font.
-    Returns the (width, height) of the box.
+    A line containing tab characters is drawn as columns. Without `align`: the first cell left aligned,
+    later cells right aligned at fixed positions, so numbers line up even with OpenCV's proportional font.
+    With `align` (a string such as "lrrlrr", one letter per column): every column gets its own width and
+    alignment, for several tables side by side. Returns the (width, height) of the box.
     """
     cv2 = _cv2()
     if not lines:
@@ -288,25 +311,42 @@ def text_block(img, lines, scale=None, color=GREEN, origin=(0, 0), alpha=0.55):
     scale = scale or max(0.38, img.shape[1] / 1280 * 0.46)
     thick = 1 if scale < 0.6 else 2
     step = int(round(26 * scale)) + 4
+    gap = int(16 * scale)
 
     def width(t):
-        return cv2.getTextSize(t, font, scale, thick)[0][0]
+        return cv2.getTextSize(t, font, scale, thick)[0][0] if t else 0
 
     cells = [ln.split("\t") for ln in lines]
-    first_w = max([width(c[0]) for c in cells if len(c) > 1] + [0])
-    col_w = max([width(x) for c in cells if len(c) > 1 for x in c[1:]] + [0]) + int(16 * scale)
-    ncols = max(len(c) for c in cells)
-    total = max([width(c[0]) for c in cells if len(c) == 1] + [first_w + col_w * (ncols - 1)] + [10])
+    tabbed = [c for c in cells if len(c) > 1]
+    if align:
+        ncols = max([len(c) for c in tabbed] + [1])
+        col_w = [max([width(c[j]) for c in tabbed if len(c) > j] + [0]) for j in range(ncols)]
+        lefts = [0]
+        for j in range(1, ncols):                       # a left-aligned column starts a new table: wider gap
+            lefts.append(lefts[-1] + col_w[j - 1] + (3 * gap if align[j] == "l" else gap))
+        table_w = lefts[-1] + col_w[-1]
+    else:
+        first_w = max([width(c[0]) for c in tabbed] + [0])
+        cw = max([width(x) for c in tabbed for x in c[1:]] + [0]) + gap
+        ncols = max(len(c) for c in cells)
+        table_w = first_w + cw * (ncols - 1)
+    total = max([width(c[0]) for c in cells if len(c) == 1] + [table_w] + [10])
     x0, y0 = origin
     x1, y1 = min(img.shape[1], x0 + total + 16), min(img.shape[0], y0 + step * len(lines) + 10)
     roi = img[y0:y1, x0:x1]
     roi[:] = (roi * (1.0 - alpha)).astype(img.dtype)
     for i, c in enumerate(cells):
         y = y0 + step * (i + 1)
-        cv2.putText(img, c[0], (x0 + 8, y), font, scale, color, thick, cv2.LINE_AA)
-        for j, x in enumerate(c[1:], start=1):
-            right = x0 + 8 + first_w + col_w * j
-            cv2.putText(img, x, (right - width(x), y), font, scale, color, thick, cv2.LINE_AA)
+        if len(c) == 1:
+            cv2.putText(img, c[0], (x0 + 8, y), font, scale, color, thick, cv2.LINE_AA)
+            continue
+        for j, x in enumerate(c):
+            if align:
+                a = align[j] if j < len(align) else "r"
+                left = x0 + 8 + lefts[j] + (0 if a == "l" else col_w[j] - width(x))
+            else:
+                left = x0 + 8 if j == 0 else x0 + 8 + first_w + cw * j - width(x)
+            cv2.putText(img, x, (left, y), font, scale, color, thick, cv2.LINE_AA)
     return x1 - x0, y1 - y0
 
 

@@ -146,9 +146,13 @@ def test_body_mode_end_to_end(tmp_path):
         assert app.legs[sd].pelvic_hike == pytest.approx(0, abs=0.5)
     assert app.legs["left"].hip_rotation_source == "foot" and app.legs["right"].hip_rotation_source == "knee"
     assert (app.core.core_flexion, app.core.core_lateral_bend, app.core.core_rotation) == pytest.approx((0, 0, 0), abs=0.5)
-    app.show_legs = True
-    text = "\n".join(app.text_lines(time.monotonic()))
-    assert "Knee flexion\t6.0\t50.0" in text and "-12.0f" in text and "Core rotation\t0.0" in text
+    # one readout table: arms and core on the left, legs on the right (single arm mode: left arm column empty)
+    rows = [r.split("\t") for r in app.body_table()]
+    assert all(len(r) == 6 for r in rows) and rows[0] == ["", "L", "R", "", "L", "R"]
+    table = {r[0]: r[1:3] for r in rows[1:] if r[0]} | {r[3]: r[4:6] for r in rows[1:] if r[3]}
+    assert table["Knee flexion"] == ["6.0", "50.0"] and table["Hip rotation"][0] == "-12.0f"
+    assert table["Core rotation"] == ["0.0", ""] and table["Elbow flexion"] == ["", "75.0"]
+    assert table["Shoulder flex/ext"][1] == "35.0"
 
     rows = list(csv.reader(open(rec, encoding="utf-8")))
     header, data = rows[0], rows[1:]

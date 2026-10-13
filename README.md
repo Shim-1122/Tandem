@@ -33,35 +33,38 @@ Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe h
 ```
 pip install -r requirements.txt
 python -m pytest                                        # no camera needed
-python scripts/live.py --side right                     # standing, hips in view
-python scripts/live.py --side right --torso desk        # seated at a desk, hips hidden
-python scripts/live.py --side both --torso desk         # both arms at once
+python scripts/live.py                                  # everything: both arms and hands, legs, core, head, face
+python scripts/live.py --torso desk                     # seated at a desk, hips hidden
+python scripts/live.py --side right                     # one arm only
 python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
 python scripts/live.py --name shyam                     # then press e to enroll your face as shyam
 ```
 
 Add `--record recordings/run1.csv` to any of these to save every update. Models download into `models/` on
-first run: hand 8 MB, pose 9 MB (full), face mesh 4 MB, face detector 0.2 MB, emotion 5 MB, and the face
+first run: hand 8 MB, pose 9 MB (full), face mesh 4 MB, face detector 0.2 MB, emotion 16 MB, and the face
 recognition model (38 MB) only when you first enroll your face. On slower computers add `--no-emotion` or
 `--no-face` (see Latency).
 
 The window has three parts:
 - **Left: the video** (mirrored in body mode, like a mirror) with the landmark wireframe (cyan body, yellow
   hands), the head's four anchor points and its axes (red forward, green up, blue right), and a compact
-  readout in the top left corner: joint angles (arms, or legs and core after `l`), gestures, and a status line
-  with each model's rate and latency.
+  readout in the top left corner: one table with every joint angle (both arms and the core on the left, both
+  legs on the right, L and R columns), gestures, and a status line with each model's rate and latency.
 - **Top right: the face panel.** Your face, who it is (after you enroll), the six cardinal emotions with
   percentages, and the head's 6 DOF (position and yaw, pitch, roll, plus motion since you zeroed it with `h`).
-- **Bottom right: the 3D panel.** In body mode it rebuilds your arms from the solved joint angles through
-  forward kinematics, with red/green/blue axes for the upper arm, forearm and hand frames, the fingers from
-  their solved joint angles, and the head turned relative to the torso (the neck). When your legs are in view
-  it zooms out to the whole body: pelvis, core and both legs with their feet. It shows what the solver
-  believes, so if it moves like you the kinematics are right, and if it disagrees with the video the angles
-  are wrong. In POV mode it shows the hand.
+- **Bottom right: the 3D panel.** In body mode it rebuilds your whole body from the solved joint angles through
+  forward kinematics: head (turned relative to the torso, with its four anchor points), both arms with red/
+  green/blue axes for the upper arm, forearm and hand frames, both hands with every finger, the core, the
+  pelvis and both legs with their feet. Anything not in view is drawn grey in a neutral pose (for example the
+  legs while you sit at a desk). It shows what the solver believes, so if it moves like you the kinematics
+  are right, and if it disagrees with the video the angles are wrong. In POV mode it shows the hand.
 
-With `--side both`, each arm has its own solver and hand, the readout shows LEFT and RIGHT columns, the
-3D panel draws both arms (cyan right, pink left), and a recording gets `L_` and `R_` columns. Both arms
-share one torso frame, so they must both be in view with the shoulders.
+Both arms are tracked by default (`--side left` or `--side right` for one); each arm has its own solver and
+hand, the 3D panel draws them cyan (right) and pink (left), and a recording gets `L_` and `R_` columns. Both
+arms share one torso frame, so the shoulders must be in view. Legs, core and head are always tracked when in
+view. Flags after a value in the readout: `!` outside the normal human range (a tracking problem), `h` held
+(shoulder rotation with a nearly straight elbow, or hip rotation without the foot in view), `f` hip rotation
+taken from the foot (knee straight).
 
 The tracker only shows an arm's angles when its shoulder and wrist are actually visible (a hidden elbow is
 predicted, see Elbow prediction); otherwise it says which joint is out of view, because MediaPipe still reports
@@ -74,7 +77,6 @@ Keys (click the video window first):
 | --- | --- |
 | `q` | quit |
 | `z` | body mode: calibrate the torso from the neutral arm pose (see Desk below) and, when you stand upright in full view, the legs and feet (see Legs); POV mode: zero the hand pose |
-| `l` | switch the readout between arm angles and leg and core angles |
 | `h` | zero the head pose (the face panel then shows motion since that moment) |
 | `e` | enroll your face for recognition under `--name` (default `me`); press it 3 to 5 times with your head turned slightly differently each time |
 | `k` | calibrate the emotion tracker to your face (about 30 seconds of prompts; `k` again cancels) |
@@ -119,7 +121,7 @@ and torso in view, hips included. Torso "up" comes from shoulders and hips.
 
 **Desk (`--torso desk`).** No hips needed. Shoulders and the tracked arm must be in view. Sit upright, let the
 tracked upper arm hang straight down beside your torso with the elbow bent 90 degrees, forearm forward and
-thumb up (with `--side both`, both arms like that), and press `z`. That pose becomes zero, and the calibration removes the camera's tilt (a laptop
+thumb up (both arms like that when both are tracked), and press `z`. That pose becomes zero, and the calibration removes the camera's tilt (a laptop
 screen leaned back 25 degrees would otherwise add 25 degrees of shoulder flexion). Press `z` again whenever
 you move the camera or your chair. If the upper arm is not hanging straight down when you press `z`, every
 flexion reading is offset by that amount. Before calibrating, the camera's vertical is used, so keep the
@@ -197,10 +199,31 @@ person looking straight at the camera.
 
 **Emotion.** The same approach as the reference project
 [atulapra/Emotion-detection](https://github.com/atulapra/Emotion-detection) (find the face, crop it, classify
-the expression with a neural network), with a stronger model that needs only OpenCV: OpenCV Zoo's facial
-expression model (MobileFaceNet), 88.3% accurate on the RAF-DB benchmark, where the reference project's
-network reaches 63.2% on FER-2013. The face is found and aligned with OpenCV's YuNet face detector, exactly
-as in the model's reference code (the scores match that code on 42 test faces).
+the expression with a neural network), with a stronger model that needs only OpenCV: HSEmotion's
+EfficientNet-B0 (`enet_b0_8_best_vgaf` from
+[av-savchenko/face-emotion-recognition](https://github.com/av-savchenko/face-emotion-recognition), Apache 2.0
+code, trained on the AffectNet dataset), on the face box from OpenCV's YuNet face detector.
+
+It replaced the first model (OpenCV Zoo's MobileFaceNet, trained on RAF-DB), which almost never showed fear.
+Both were measured with this code on 1048 faces from the AffectNet validation set, about 150 per emotion:
+
+| Emotion | First model | HSEmotion (now) |
+| --- | --- | --- |
+| Fear | 9% | 78% |
+| Anger | 23% | 79% |
+| Disgust | 31% | 61% |
+| Sadness | 38% | 67% |
+| Surprise | 54% | 70% |
+| Happiness | 100% | 89% |
+| Neutral | 45% | 39% |
+| Average | 43% | 69% |
+
+The first model called most fear faces surprise. AffectNet is HSEmotion's own benchmark (its validation faces
+were not used for training), so part of the gap is home advantage, but a second random sample run through the
+app's own code gave the same picture (fear 71% against 10%). HSEmotion's weak spot is neutral: a relaxed face
+often reads as mild anger or surprise. Calibrating to your face (key `k`, below) corrects exactly that. The
+first model is still available with `--emotion-model opencv`; calibrations are kept per model, so calibrate
+again after switching.
 
 The face panel shows the **six cardinal emotions with percentages: happiness, sadness, anger, fear, surprise
 and disgust**, the strongest in green. The model also scores neutral, shown underneath; the six and neutral
@@ -241,7 +264,7 @@ are excluded from git.
 ## Legs and core (10 DOF per leg, 3 in the core)
 
 Legs and core are tracked whenever they are in view, in body mode: stand about 2.5 to 3.5 m from the camera
-so you are in the frame from head to feet. Press `l` to see them in the readout. Each leg needs its hip, knee
+so you are in the frame from head to feet; they are in the right half of the readout. Each leg needs its hip, knee
 and ankle in view (both hips for the pelvis); ankle and foot angles also need the heel and toe.
 
 | Joint | Angle | Positive direction |
@@ -380,7 +403,7 @@ reported with the wrist because the hand's orientation is what shows them.
 4. **Head.** Face the camera squarely and check that yaw, pitch and roll read near zero; then turn, nod and tilt
    and confirm the signs in the Head table. If the distance `z` is clearly wrong, set `--fov` for your camera.
 5. **Latency.** Watch the status line while you move: the hand should run near the camera rate.
-6. **Legs.** Stand in full view, press `z`, then `l`: everything should read near zero. Bend one knee, lift a
+6. **Legs.** Stand in full view and press `z`: the leg and core angles should read near zero. Bend one knee, lift a
    thigh forward and out, and turn a foot out, and confirm the signs in the Legs table.
 7. **Emotion.** Press `k` and follow the prompts; the held-out accuracy afterwards tells you how well the
    tracker reads your face in your lighting.
@@ -399,7 +422,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
   `--side both`); per leg the ten leg angles and the hip rotation source (`L_` and `R_`), the three core angles and
   `leg_up_source`; then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
   `identity`, `match` and `emotion_calibrated_for`. A row is written whenever any model delivers a new result.
-- Tested: 168 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
+- Tested: 171 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
   and the core (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted
   camera, PnP hand position recovery, all gestures in random orientations for both hands, head pose round trips,
   emotion alignment against an independent least-squares solution, the emotion calibration fit (gradient checked,
