@@ -1025,7 +1025,7 @@ class App:
 
     def run(self, show=None, waitkey=None):
         cv2 = self.cv2
-        show = show or (lambda img: cv2.imshow("Homunculus Shadowing", img))
+        show = show or (lambda img: cv2.imshow("Tandem", img))
         waitkey = waitkey or (lambda: cv2.waitKey(1) & 0xFF)
         last = 0
         try:

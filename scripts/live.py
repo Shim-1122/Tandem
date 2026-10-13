@@ -45,7 +45,7 @@ from vtrack.pipeline import open_camera                         # noqa: E402
 
 
 def parse_args(argv=None) -> Config:
-    ap = argparse.ArgumentParser(description="Homunculus Shadowing live tracker")
+    ap = argparse.ArgumentParser(description="Tandem live tracker")
     ap.add_argument("--mode", choices=["body", "pov"], default="body")
     ap.add_argument("--camera", type=int, default=0, help="camera number (0 is the built-in webcam)")
     ap.add_argument("--width", type=int, default=1280, help="requested camera width")

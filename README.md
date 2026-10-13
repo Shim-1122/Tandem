@@ -1,9 +1,9 @@
-# Homunculus Shadowing
+# Tandem
 
-Single-webcam motion capture built as the control input for **Homunculus**, a planned pneumatic humanoid arm,
-so the arm can shadow a person. It tracks both arms, every finger, hand gestures, both legs and the core, the
-head, where the eyes look, the face (who it is and the expression), and which objects each hand is holding,
-with the grip force the arm should use for each one.
+**Tandem** is single-webcam motion capture built as the control input for **Homunculus**, a planned pneumatic
+humanoid arm, so the arm can shadow a person. It tracks both arms, every finger, hand gestures, both legs and the
+core, the head, where the eyes look, the face (who it is and the expression), and which objects each hand is
+holding, with the grip force the arm should use for each one.
 
 > **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side
 > only: it tracks a person and turns that into joint angles, gestures, gaze targets and grip forces ready for
@@ -62,7 +62,7 @@ connection the first time.
    safest choice (the tests also pass on 3.9 and 3.13). On Windows, tick **"Add python.exe to PATH"** on the
    first screen of the installer.
 2. **Get the code.** On GitHub, signed in, open the repository and click **Code > Download ZIP**, then unzip it
-   (or, with Git installed: `git clone https://github.com/Shim-1122/Homunculus-Shadowing.git`).
+   (or, with Git installed: `git clone https://github.com/Shim-1122/Tandem.git`).
 3. **Open a terminal in that folder.**
    - Windows: open the folder in File Explorer, click the address bar, type `powershell` and press Enter.
    - Mac: open Terminal, type `cd ` (with a space), drag the folder onto the window, and press Enter.
