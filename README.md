@@ -2,7 +2,7 @@
 
 Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, face recognition and emotion with per-person calibration, from a single webcam.
 
-> **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side only: it tracks a person and produces joint angles and 0..1 joint commands ready for the arm, but nothing here has driven real hardware yet. It has been tested with automated tests, simulated motion and photos, not yet with a live webcam on the final setup.
+> **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side only: it tracks a person and produces joint angles and 0..1 joint commands ready for the arm, but nothing here has driven real hardware yet.
 
 Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
 
