@@ -1,13 +1,15 @@
 # Tandem
 
 **Tandem** is single-webcam motion capture built as the control input for **Homunculus**, a planned pneumatic
-humanoid arm, so the arm can shadow a person. It tracks both arms, every finger, hand gestures, both legs and the
-core, the head, where the eyes look, the face (who it is and the expression), and which objects each hand is
-holding, with the grip force the arm should use for each one.
+humanoid arm, so the arm can shadow a person. The arm is step one of a larger goal: a full humanoid robot. That is
+why Tandem already tracks the whole body and not just one arm: both arms, every finger, hand gestures, both legs
+and the core, the head, where the eyes look, the face (who it is and the expression), and which objects each hand
+is holding, with the grip force the arm should use for each one. The arm will use the arm and hand angles first;
+the rest is ready for the parts of the humanoid that come after it.
 
-> **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side
-> only: it tracks a person and turns that into joint angles, gestures, gaze targets and grip forces ready for
-> the arm, but nothing here has driven real hardware yet.
+> **Status: the Homunculus arm is not built yet.** It is a planned build, and the first step toward a full
+> humanoid. This repository is the vision side only: it tracks a person and turns that into joint angles,
+> gestures, gaze targets and grip forces ready for the arm, but nothing here has driven real hardware yet.
 
 **85 tracked degrees of freedom from one camera:** 7 per arm (14), 21 per hand (42), 10 per leg (20), 3 in the
 core and 6 for the head, plus 2 eye angles, 16 hand gestures, 7 emotion scores, and grasps of 16 everyday
@@ -690,6 +692,11 @@ camera), its motion since `z` was pressed `dx_cm`, `dy_cm`, `dz_cm`, `twist`, `p
 angles, the 7 grasp columns, and `objects_seen`.
 
 ## For the arm: what is ready and what is not
+
+The plan is to build the humanoid one part at a time, starting with the Homunculus arm (shoulder, elbow, wrist and
+hand). Each later part has its tracking here already: the second arm, the head and neck (head pose, and the eyes
+for where it looks), the core, and the legs. So each new part needs its hardware and its joint mapping, not new
+vision work.
 
 Ready, from the vision side:
 - **Joint angles** for both arms, hands, legs, core and head, in fixed conventions (zero poses and sign tables
