@@ -1,10 +1,10 @@
 # Homunculus Shadowing
 
-Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, face recognition and emotion with per-person calibration, from a single webcam.
+Camera-based full-body tracking built as the control input for Homunculus, a pneumatic humanoid arm, so it can shadow a person's motion: shoulder (3 DOF), elbow, and wrist (3 DOF) angles, 21 finger joints and 16 hand gestures, 10 DOF per leg and 3 in the core, the head's 6 degrees of freedom, eye tracking with target locking, face recognition and emotion with per-person calibration, from a single webcam.
 
 > **Status: the Homunculus arm is not built yet.** It is a planned build. This repository is the vision side only: it tracks a person and produces joint angles and 0..1 joint commands ready for the arm, but nothing here has driven real hardware yet.
 
-Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
+Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe hand, pose and face landmarks; OpenCV face detection, emotion and recognition) -> One Euro smoothing -> joint angles, gestures, head pose, gaze and target, emotions -> normalized 0..1 joint commands with limits and slew-rate control.
 
 ## What is here
 
@@ -14,6 +14,7 @@ Pipeline: camera thread (newest frame only) -> one thread per model (MediaPipe h
 | `vtrack/pipeline.py` | Low-latency capture and model threads (newest frame only), CPU priority for hands, rate and latency meters |
 | `vtrack/tracker.py` | MediaPipe Tasks wrappers (hand, pose, face mesh; VIDEO mode), model download, hand-to-arm matching by position |
 | `vtrack/head.py` | Head pose with 6 DOF (position and yaw, pitch, roll) from 4 anchor points on the face |
+| `vtrack/gaze.py` | Eye tracking from the iris landmarks, 9-dot gaze calibration onto the video, target locking |
 | `vtrack/face.py` | Face detection, emotion (six cardinal emotions plus neutral, in percent) and face recognition |
 | `vtrack/emotion_cal.py` | Per-person emotion calibration: guided capture, fitted correction, held-out accuracy |
 | `vtrack/legs.py` | Legs (hip 4, knee 1, ankle 3, foot 2 DOF each) and core (3 DOF) from the pose landmarks |
@@ -40,6 +41,7 @@ python scripts/live.py --torso desk                     # seated at a desk, hips
 python scripts/live.py --side right                     # one arm only
 python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) camera, hands only
 python scripts/live.py --name shyam                     # then press e to enroll your face as shyam
+python scripts/live.py --gaze-dwell 1.0                 # also lock a target by looking at it for 1 second
 ```
 
 Add `--record recordings/run1.csv` to any of these to save every update. Models download into `models/` on
@@ -82,6 +84,8 @@ Keys (click the video window first):
 | `h` | zero the head pose (the face panel then shows motion since that moment) |
 | `e` | enroll your face for recognition under `--name` (default `me`); press it 3 to 5 times with your head turned slightly differently each time |
 | `k` | calibrate the emotion tracker to your face (about 30 seconds of prompts; `k` again cancels) |
+| `g` | calibrate eye tracking: look at 9 dots in turn (about 20 seconds; `g` again cancels) |
+| `t` | lock onto the spot you are looking at, or release it (a pinch with either hand does the same) |
 | `f` | cycle the finger joint table (off, then each tracked hand) |
 | `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
 | `w` | toggle the wireframe |
@@ -196,6 +200,49 @@ image rotations within 1 to 2 degrees. Distance assumes an average-size face and
 (your camera's horizontal field of view), so relative motion after `h` is more accurate than absolute
 distance. A fit of only the 4 flat image positions was tested and rejected: it read 27 degrees of pitch on a
 person looking straight at the camera.
+
+## Eyes: gaze and target locking
+
+The face mesh model also finds the center of each iris. With the head pose, that gives where you are looking:
+1. The eye corners and the iris centers are placed in 3D (the same depth model as the head pose) and turned
+   into the head's own frame, which removes head rotation and perspective.
+2. How far each iris sits from the middle of its eye corners gives the eye's rotation in the head, assuming
+   a 12 mm eyeball radius, averaged over both eyes. A blink (lid gap under 13% of the eye width) is skipped
+   and the last gaze point is kept.
+3. The gaze ray, from between the eyes, is followed until it meets the plane of the camera, which is the
+   screen the webcam sits on.
+
+The readout shows `eyes yaw pitch` (degrees, the same directions as the head: yaw + toward your left, pitch +
+up), and the 3D panel draws the gaze as a cyan line from the head.
+
+**Calibrate (key `g`).** The video then shows only red dots, one at a time, 9 in all (about 20 seconds). Keep
+your head still and look at each dot until it moves; a ring closes in on each dot to draw your eyes to it
+before recording starts. An affine map (6 numbers) from the camera plane to the video is fitted, and then the
+video shows a cyan circle where you are looking. Because the map is built on the 3D gaze point and not on raw
+iris positions, it keeps working when you move or turn your head a little. When it finishes, the readout gives
+its accuracy, measured by leaving each dot out of the fit in turn and predicting it (`gaze calibrated:
+accuracy about N deg (M px), from 9 dots`). If your eyes were found on fewer than 6 dots, or your gaze hardly moved between them,
+it says so and asks you to try again. Calibration is not saved: do it again after moving the window, the
+camera or your seat.
+
+**Target locking.** Look at something in the video and press `t` or pinch (thumb and index finger together,
+either hand). A red box and crosshair mark the locked target; `t` or another pinch releases it. With
+`--gaze-dwell 1.0`, looking at one spot for 1 second also locks it (an arc around the cursor fills up while
+you hold still). The locked target is given in the camera's own pixels (the video is shown mirrored, the
+recording is not) and as a unit ray from the camera, `target_ray_x/y/z` (x right, y down, z away), which is
+what a robot with a camera next to this one would turn toward. Locking needs a calibration first.
+
+**Accuracy, honestly.** Webcam eye tracking is coarse: the iris is a few pixels across, so expect a few
+degrees after calibration (about a thumb's width at arm's length), more when you are far from the camera or
+the light is dim. In simulation (synthetic faces, landmark noise of 0.25, 0.5 and 1 pixel) the calibration's
+left-out error was 0.4, 0.8 and 1.5 degrees, and the frame-to-frame jitter of the smoothed cursor 0.3, 0.8
+and 1.9 degrees. A real webcam is noisier than that; your own calibration result is the number to go by.
+Without calibration, the eye angles alone are approximate (each person's eyes differ slightly from the model),
+and the absolute direction is only as good as the head pose. Glasses with strong reflections and narrow eyes
+can make the iris harder to find.
+
+Recorded as `eyes_open`, `eye_yaw`, `eye_pitch`, `gaze_x_px`, `gaze_y_px` (camera pixels), `target_locked`,
+`target_x_px`, `target_y_px` and `target_ray_x`, `target_ray_y`, `target_ray_z`.
 
 ## Face recognition and emotion
 
@@ -409,6 +456,8 @@ reported with the wrist because the hand's orientation is what shows them.
    thigh forward and out, and turn a foot out, and confirm the signs in the Legs table.
 7. **Emotion.** Press `k` and follow the prompts; the held-out accuracy afterwards tells you how well the
    tracker reads your face in your lighting.
+8. **Eyes.** Press `g` and follow the dots, then look at a few things in the video: the cyan circle should
+   follow your eyes within the accuracy the calibration reported. Lock one with `t` and check the red box.
 
 Expect the largest errors in shoulder rotation and forearm rotation: they come from small differences between
 noisy landmarks, and a few centimeters of elbow or wrist error is several degrees over a 25 to 30 cm segment.
@@ -423,12 +472,15 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 - Recording columns: per arm the gesture, the seven angles, flags and 21 finger angles (`L_` and `R_` prefixes with
   `--side both`); per leg the ten leg angles and the hip rotation source (`L_` and `R_`), the three core angles and
   `leg_up_source`; then `torso_source`, head position and angles, neck angles, the seven emotion percentages,
-  `identity`, `match` and `emotion_calibrated_for`. A row is written whenever any model delivers a new result.
-- Tested: 171 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
+  `identity`, `match` and `emotion_calibrated_for`, then the eye and target columns (see Eyes). A row is written whenever any model delivers a new result.
+- Tested: 183 automated tests (Python 3.9 and 3.13), including kinematics round trips for both arms and both legs
   and the core (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted
   camera, PnP hand position recovery, all gestures in random orientations for both hands, head pose round trips,
-  emotion alignment against an independent least-squares solution, the emotion calibration fit (gradient checked,
-  recovers known corrections), the threaded pipeline, and the whole app with simulated models, including a full
-  emotion calibration. The app was also run headless with the real models on photos (body, both arms, hidden
-  elbows, a full-body yoga pose, POV with thumbs up, peace, pointing and open hands). Not tested here: accuracy
-  with a real camera on your setup. Use the checks above.
+  eye angles and gaze points (exact for random head poses), gaze calibration that survives head motion, target
+  locking, emotion alignment against an independent least-squares solution, the emotion calibration fit (gradient
+  checked, recovers known corrections), the threaded pipeline, and the whole app with simulated models, including
+  a full emotion calibration and a full gaze calibration followed by locking a target with a key and with pinches.
+  The app was also run headless with the real models on photos (body, both arms, hidden elbows, a full-body yoga
+  pose, POV with thumbs up, peace, pointing and open hands; the eyes of a portrait looking into the camera read
+  yaw 0 and pitch 5 degrees, and a gaze calibration on a still photo was correctly refused). Not tested here:
+  accuracy with a real camera on your setup. Use the checks above.

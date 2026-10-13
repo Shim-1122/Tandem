@@ -19,6 +19,7 @@ from .elbow import ElbowPredictor, SegmentLengths
 from .emotion_cal import CalibrationSession, calibration_path, load_all
 from .face import EMOTIONS, EmotionSmoother, EmotionTask, softmax
 from .filters import HAND_SMOOTHING, AngleSmoother, JitterMeter, LandmarkSmoother, OneEuroFilter, make_arm_smoothers
+from .gaze import GazeCalibrationSession, TargetLock, calibration_targets, eye_state
 from .fingers import FINGER_KEYS, THUMB_KEYS, HandKinematics, flat, hand_fk, hand_geometry, palm_to_world
 from .gestures import Gesture, GestureFilter, classify_hand
 from .handpose import HandPoseZero, camera_matrix, hand_frame, hand_pose_camera
@@ -71,6 +72,9 @@ class Config:
     emotion_min_hz: float = 3.0
     cal_prepare_s: float = 1.5         # emotion calibration: seconds to get each expression ready
     cal_capture_s: float = 2.5         #   and seconds recorded
+    gaze_dwell: float = 0.0            # > 0: also lock a target by holding your gaze still this many seconds
+    gaze_settle_s: float = 1.0         # gaze calibration: seconds to look at each dot before recording
+    gaze_capture_s: float = 1.2        #   and seconds recorded per dot
     cores: int | None = None           # CPU cores to plan for (default: all)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
@@ -216,6 +220,11 @@ class App:
         self.head_ang = AngleSmoother(min_cutoff=1.0, beta=0.05)
         self.head_pos = OneEuroFilter(min_cutoff=1.0, beta=0.3)     # filters centimeters
         self.head_zero = HeadPoseZero()
+        # eyes: gaze, calibration onto the video, target lock
+        self.eye, self.gaze_map, self.gaze_session, self.gaze_pt = None, None, None, None
+        self.gaze_filter = OneEuroFilter(min_cutoff=0.6, beta=0.01)       # pixels
+        self.target = TargetLock(self.size[0], self.size[1], self.K, mirrored=not self.pov, dwell_s=cfg.gaze_dwell)
+        self.prev_gestures = {}
         self.emotions, self.emotion_res = None, None
         self.emo_smooth = EmotionSmoother()
         self.calibrations = load_all(cfg.faces_dir, cfg.emotion_model) if cfg.emotion else {}
@@ -277,6 +286,8 @@ class App:
             self._calibrate_body()
         if self.cal_session is not None and self.cal_session.finished(time.monotonic() - 0.3):
             self._finish_emotion_calibration()
+        if self.gaze_session is not None and self.gaze_session.finished(time.monotonic() - 0.2):
+            self._finish_gaze_calibration()
         task = self.fns.get("emotion")
         if getattr(task, "message", ""):
             self.say(task.message)
@@ -309,6 +320,11 @@ class App:
             self.gestures[sd] = self.gfilters[sd].update(classify_hand(w), r.t_capture).value
             self.fingers[sd] = self.hand_kins[sd].solve(w)
             self.finger_geo[sd] = hand_geometry(w, sd)
+        if not self.pov:                            # a new pinch (either hand) locks or releases the target
+            for sd, g in self.gestures.items():
+                if g == Gesture.PINCH.value and self.prev_gestures.get(sd) != Gesture.PINCH.value:
+                    self._toggle_target(f"{sd} pinch")
+            self.prev_gestures = dict(self.gestures)
         if self.pov:
             self._update_pov()
 
@@ -477,6 +493,47 @@ class App:
         axes = head_axes_from_angles(a["yaw"], a["pitch"], a["roll"])
         self.head = dataclasses.replace(hp, axes=axes, position_m=np.asarray(pos, float), yaw=a["yaw"],
                                         pitch=a["pitch"], roll=a["roll"])
+        self._update_gaze(L, hp, r.t_capture)
+
+    def _update_gaze(self, L, pose, t):
+        """Eye angles, the calibrated gaze point on the video (as displayed), dwell locking."""
+        self.eye = eye_state(L, pose, self.size[0], self.size[1], self.K)
+        e = self.eye
+        if not e.valid or e.plane_point is None:
+            return                                   # blink or looking away: keep the last gaze point
+        if self.gaze_session is not None:
+            self.gaze_session.add(e.plane_point, float(np.linalg.norm(np.append(e.plane_point, 0.0) - e.origin)), t)
+        if self.gaze_map is not None:
+            self.gaze_pt = self.gaze_filter(self.gaze_map.predict(e.plane_point), t)
+            if self.target.update(self.gaze_pt, t):
+                self.say(f"target locked at {self._target_text()} (held gaze)")
+
+    def _target_text(self):
+        c = self.target.camera_point()
+        return f"({c[0]:.0f}, {c[1]:.0f}) px" if c is not None else "--"
+
+    def _toggle_target(self, how):
+        if self.gaze_map is None:
+            self.say("target lock needs gaze calibration first: press g")
+            return
+        res = self.target.toggle(self.gaze_pt, time.monotonic())
+        if res == "locked":
+            self.say(f"target locked at {self._target_text()} ({how})")
+        elif res == "released":
+            self.say(f"target released ({how})")
+        else:
+            self.say("no gaze point yet: look at the video")
+
+    def _finish_gaze_calibration(self):
+        session, self.gaze_session = self.gaze_session, None
+        try:
+            self.gaze_map = session.result()
+        except ValueError as exc:
+            self.say(f"gaze calibration failed: {exc}; press g to try again")
+            return
+        self.gaze_filter.reset()
+        self.gaze_pt = None
+        self.say(f"gaze calibrated: {self.gaze_map.summary()}")
 
     def _update_pov(self):
         sd = self.cfg.hand
@@ -551,11 +608,12 @@ class App:
             lines.append(f"torso up: {self.torso_src}   legs up: {self.leg_up_src}"
                          + ("   (z: calibrate)" if "camera vertical" in (self.torso_src, self.leg_up_src) else ""))
             lines.append("gesture: " + "  ".join(f"{sd} {self.gestures[sd]}" for sd in self.sides))
+            lines.append(self.gaze_line())
         if self.message and now - self.message_t < 4.0:
             lines.append(self.message)
         lines.append(self.status_line(now))
         keys = "q quit  w wire  f fingers  " + ("z zero hand" if self.pov else
-                                                  "z calibrate  h zero head  e enroll  k emotion cal  c checks")
+                                                  "z calibrate  h head zero  e enroll  k emotion cal  g gaze cal  t lock  c checks")
         lines.append(keys)
         return lines
 
@@ -600,6 +658,20 @@ class App:
         left_rows += [["", "", ""]] * (n - len(left_rows))
         right_rows += [["", "", ""]] * (n - len(right_rows))
         return ["\tL\tR\t\tL\tR"] + ["\t".join(a + b) for a, b in zip(left_rows, right_rows)]
+
+    def gaze_line(self):
+        e = self.eye
+        if "face" not in self.workers:
+            return "eyes: off (needs the face model)"
+        if e is None:
+            return "eyes: no face"
+        if not e.valid:
+            return "eyes: closed or not found"
+        eyes = f"eyes yaw {num(e.yaw, 0)} pitch {num(e.pitch, 0)} (approx.)"
+        if self.gaze_map is None:
+            return eyes + "   gaze: press g to calibrate"
+        target = f"target LOCKED {self._target_text()}" if self.target.locked else "target: t or pinch to lock"
+        return f"{eyes}   gaze {self.gaze_map.error_deg:.1f} deg   {target}"
 
     def finger_lines(self):
         tsd = self.table_cycle[self.table_i]
@@ -662,8 +734,12 @@ class App:
                 draw_head_on_video(video, self.head, self.K)
         if not self.pov:
             video = cv2.flip(video, 1)            # mirror view for a camera facing you
-        _, h1 = text_block(video, self.text_lines(now), align=None if self.pov else "lrrlrr")
-        text_block(video, self.finger_lines(), origin=(0, h1 + 4))
+        if self.gaze_session is not None:              # dots only: nothing else on the video to look at
+            self._draw_gaze_calibration(video, now)
+        else:
+            _, h1 = text_block(video, self.text_lines(now), align=None if self.pov else "lrrlrr")
+            text_block(video, self.finger_lines(), origin=(0, h1 + 4))
+            self._draw_gaze(video, now)
         if self.cal_session is not None:
             self._banner(video, self.cal_session.prompt(now))
         size = video.shape[0] // 2
@@ -680,19 +756,60 @@ class App:
                                                      if sd in self.sides},
                                     head_axes=self.neck_axes(),
                                     legs_by_side={sd: self.legs[sd] for sd in self.legs if not self.leg_missing[sd]},
-                                    core=self.core, full_body=True)
+                                    core=self.core, full_body=True, gaze_dir=self.gaze_in_torso())
         return compose_layout(video, self.face_panel(frame, size), kin, self.cfg.window_width)
 
-    def _banner(self, img, text):
-        """Large instruction at the bottom of the video (emotion calibration)."""
+    def _banner(self, img, text, top=False):
+        """Large instruction across the bottom (or top) of the video (calibrations)."""
         cv2 = self.cv2
         h, w = img.shape[:2]
         scale = max(0.6, w / 1280 * 0.85)
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
-        y0 = h - th - 34
-        roi = img[y0:h - 10, 10:min(w - 10, tw + 40)]
+        y0, y1 = (10, th + 44) if top else (h - th - 34, h - 10)
+        roi = img[y0:y1, 10:min(w - 10, tw + 40)]
         roi[:] = (roi * 0.35).astype(img.dtype)
-        cv2.putText(img, text, (25, h - 26), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 230, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, text, (25, y1 - 16), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 230, 255), 2, cv2.LINE_AA)
+
+    def _draw_gaze_calibration(self, img, now):
+        cv2 = self.cv2
+        s = self.gaze_session
+        i, phase, left = s.phase(now)
+        if phase == "done":
+            self._banner(img, "Gaze calibration: fitting ...", top=True)
+            return
+        x, y = (int(round(v)) for v in s.targets[i])
+        if phase == "settle":                          # a ring closing in on the dot draws the eyes to it
+            r = int(14 + 40 * left / s.settle)
+            cv2.circle(img, (x, y), r, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.circle(img, (x, y), 11, (40, 40, 255), -1, cv2.LINE_AA)
+        cv2.circle(img, (x, y), 3, (255, 255, 255), -1, cv2.LINE_AA)
+        self._banner(img, f"Gaze calibration {i + 1}/{len(s.targets)}: look at the red dot, keep your head still",
+                     top=True)
+
+    def _draw_gaze(self, img, now):
+        """Gaze cursor and the locked target, on the video as displayed."""
+        cv2 = self.cv2
+        if self.gaze_pt is not None and self.gaze_map is not None:
+            g = tuple(int(round(v)) for v in self.gaze_pt)
+            cv2.circle(img, g, 16, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.circle(img, g, 2, (255, 255, 0), -1, cv2.LINE_AA)
+            prog = self.target.dwell_progress(now)
+            if prog > 0 and not self.target.locked:
+                cv2.ellipse(img, g, (22, 22), -90, 0, int(360 * prog), (0, 200, 255), 3, cv2.LINE_AA)
+        if self.target.locked:
+            x, y = (int(round(v)) for v in self.target.display_point)
+            red = (40, 40, 255)
+            cv2.rectangle(img, (x - 28, y - 28), (x + 28, y + 28), red, 2, cv2.LINE_AA)
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                cv2.line(img, (x + 12 * dx, y + 12 * dy), (x + 40 * dx, y + 40 * dy), red, 2, cv2.LINE_AA)
+            cv2.putText(img, "LOCKED", (x - 28, y - 36), cv2.FONT_HERSHEY_SIMPLEX, 0.6, red, 2, cv2.LINE_AA)
+
+    def gaze_in_torso(self):
+        """Gaze direction in the torso frame (for the 3D panel), when the eyes and the torso are known."""
+        e = self.eye
+        if e is None or not e.valid or self.thorax is None:
+            return None
+        return self.thorax.T @ e.direction
 
     def handle_key(self, key):
         k = chr(key) if 0 <= key < 256 else ""
@@ -724,6 +841,18 @@ class App:
                 self.cal_session = CalibrationSession(who, time.monotonic(), self.cfg.cal_prepare_s,
                                                       self.cfg.cal_capture_s, model=self.cfg.emotion_model)
                 self.say(f"emotion calibration for {who}: follow the prompts ({self.cal_session.duration:.0f} s)")
+        elif k == "g":
+            if "face" not in self.workers:
+                self.say("eye tracking needs the face model (it is off)")
+            elif self.gaze_session is not None:
+                self.gaze_session = None
+                self.say("gaze calibration cancelled")
+            else:
+                self.gaze_session = GazeCalibrationSession(calibration_targets(*self.size), time.monotonic(),
+                                                           self.cfg.gaze_settle_s, self.cfg.gaze_capture_s)
+                self.say(f"gaze calibration: look at each dot ({self.gaze_session.duration:.0f} s)")
+        elif k == "t":
+            self._toggle_target("key t")
         elif k == "e":
             task = self.fns.get("emotion")
             if task is None:
@@ -752,7 +881,8 @@ class App:
             cols += CORE_FIELDS + ["leg_up_source"]
             cols += ["torso_source", "head_x_cm", "head_y_cm", "head_z_cm", "head_yaw", "head_pitch", "head_roll",
                      "neck_yaw", "neck_pitch", "neck_roll", *[f"emotion_{e}_pct" for e in EMOTIONS], "identity", "match",
-                     "emotion_calibrated_for"]
+                     "emotion_calibrated_for", "eyes_open", "eye_yaw", "eye_pitch", "gaze_x_px", "gaze_y_px",
+                     "target_locked", "target_x_px", "target_y_px", "target_ray_x", "target_ray_y", "target_ray_z"]
         self.writer.writerow(cols)
 
     def write_row(self, t):
@@ -788,6 +918,12 @@ class App:
                 *([round(h.yaw, 2), round(h.pitch, 2), round(h.roll, 2)] if h else [nan] * 3),
                 *[round(v, 2) for v in neck], *emo, (er or {}).get("identity") or "",
                 round(er["match"], 3) if er else nan, self.cal_person or ""]
+        e = self.eye
+        g = self.target.camera_point(self.gaze_pt) if self.gaze_pt is not None else None
+        tp, ray = self.target.camera_point() if self.target.locked else None, self.target.ray()
+        row += [int(bool(e and e.valid)), *([round(e.yaw, 2), round(e.pitch, 2)] if e and e.valid else [nan, nan]),
+                *(np.round(g, 1) if g is not None else [nan, nan]), int(self.target.locked),
+                *(np.round(tp, 1) if tp is not None else [nan, nan]), *(np.round(ray, 4) if ray is not None else [nan] * 3)]
         self.writer.writerow(row)
 
     # ------------------------------------------------------------------ loop

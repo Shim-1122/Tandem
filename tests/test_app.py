@@ -261,3 +261,74 @@ def test_standing_calibration_corrects_a_tilted_camera():
         for k in ("hip_flexion", "hip_abduction", "knee_flexion", "ankle_dorsiflexion", "foot_pitch", "foot_roll"):
             assert getattr(a, k) == pytest.approx(0.0, abs=0.5), (sd, k)
     assert app2.core.core_flexion == pytest.approx(0.0, abs=0.5)
+
+
+def test_eye_tracking_calibration_and_target_lock_through_the_app(tmp_path):
+    """A simulated person looks at each calibration dot, then at a spot, and locks it (key t and pinch)."""
+    from tests.test_gaze import face as gaze_face, plane_of
+    from tests.test_gestures import touching
+    look = {"at": np.array([640.0, 360.0]), "pinch": False}
+    est = HeadPoseEstimator()
+
+    def face_fn(f):
+        L, _, _ = gaze_face((0.0, -5.0, 0.0), (0.0, 0.08, 0.6), target=plane_of(look["at"]))
+        return L, est.solve(L, W, H, K)
+
+    pose_w, pose_img, hand_w, hand_img = scene()
+    pinch_w = touching(False)
+    pinch_w = pinch_w - pinch_w.mean(axis=0)
+    models = fake_models()
+    models["face"] = lambda: face_fn
+    models["hand"] = lambda: (lambda f: [HandResult("Left", (pinch_w if look["pinch"] else hand_w).copy(), hand_img.copy())])
+    cfg = Config(cores=8, face_hz=60, gaze_settle_s=0.15, gaze_capture_s=0.25, record=tmp_path / "gaze.csv")
+    app = App(cfg, FakeCap(), models)
+    last, t0 = 0, time.monotonic()
+
+    def run(seconds, until=None):
+        nonlocal last
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < seconds and not (until and until()):
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            app.step(f)
+
+    try:
+        run(0.3)
+        assert app.eye is not None and app.eye.valid and app.gaze_map is None
+        app.handle_key(ord("t"))
+        assert "gaze calibration first" in app.message
+        app.handle_key(ord("g"))
+        session = app.gaze_session
+        assert session is not None and len(session.targets) == 9
+
+        def follow():                                         # look at the dot being shown
+            i, _, _ = session.phase(time.monotonic())
+            look["at"] = session.targets[min(i, 8)]
+            return app.gaze_session is None
+
+        while app.gaze_session is not None and time.monotonic() - t0 < 15:
+            follow()
+            run(0.02)
+        assert app.gaze_map is not None, app.message
+        assert app.gaze_map.dots == 9 and app.gaze_map.error_px < 1.0 and "gaze calibrated" in app.message
+        look["at"] = np.array([300.0, 200.0])
+        run(1.0)
+        assert app.gaze_pt == pytest.approx([300.0, 200.0], abs=2.0)
+        app.handle_key(ord("t"))
+        assert app.target.locked and app.target.display_point == pytest.approx([300.0, 200.0], abs=2.0)
+        assert app.target.camera_point() == pytest.approx([W - 1 - 300.0, 200.0], abs=2.0)   # video is mirrored
+        assert "LOCKED" in app.gaze_line()
+        look["pinch"] = True                                  # a pinch releases it
+        run(0.6)
+        assert not app.target.locked and "released" in app.message
+        look["pinch"] = False
+        run(0.4)
+        look["pinch"] = True                                  # and another pinch locks again
+        run(0.6)
+        assert app.target.locked
+    finally:
+        app.close()
+    rows = list(csv.reader(open(tmp_path / "gaze.csv", encoding="utf-8")))
+    last_row = dict(zip(rows[0], rows[-1]))
+    assert last_row["target_locked"] == "1" and float(last_row["target_ray_z"]) > 0.5
+    assert abs(float(last_row["gaze_x_px"]) - (W - 1 - 300)) < 3

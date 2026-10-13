@@ -70,7 +70,7 @@ def render_arm_panel(angles, side="right", size=480, yaw_deg=-35.0, pitch_deg=-2
 
 
 def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, note="", fingers_by_side=None,
-                      head_axes=None, legs_by_side=None, core=None, full_body=False):
+                      head_axes=None, legs_by_side=None, core=None, full_body=False, gaze_dir=None):
     """3D view of the body rebuilt from solved angles. Returns a BGR image.
 
     angles_by_side: {"right": ArmAngles or dict, "left": ...}; either side may be omitted or all NaN.
@@ -84,6 +84,7 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
     pelvic hike, the chest turns on it by the core angles, and the legs hang from it.
     full_body: always draw the whole body (both arms, both legs, pelvis, core, head); parts that are not in
     view are drawn grey in a neutral pose (arms and legs straight down, head facing forward).
+    gaze_dir: optional unit gaze direction in the torso frame; drawn as a line from the head.
     Drawn as a mirror view (your right side on the right), matching the mirrored video. Small
     red/green/blue axes show each segment's frame: upper arm at the elbow, forearm at the wrist,
     hand at the knuckles, thigh at the knee, foot at the ankle.
@@ -251,6 +252,10 @@ def render_arms_panel(angles_by_side, size=480, yaw_deg=-30.0, pitch_deg=-20.0, 
         for i in range(3):
             a, b = pr(head_c, head_c + 0.13 * head_axes[:, i])
             cv2.arrowedLine(img, a, b, AXIS_COLORS[i], 2, cv2.LINE_AA, tipLength=0.25)
+        if gaze_dir is not None:                         # where the eyes look
+            a, b = pr(head_c, head_c + 0.45 * np.asarray(gaze_dir, float))
+            cv2.line(img, a, b, (255, 255, 0), 1, cv2.LINE_AA)
+            cv2.circle(img, b, 3, (255, 255, 0), -1, cv2.LINE_AA)
     if drawn == 0 and not full:
         cv2.putText(img, "no arm pose", (20, size // 2 + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, GREY, 2)
     cv2.putText(img, "solved kinematics (mirror view)", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)

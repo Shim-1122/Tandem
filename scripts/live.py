@@ -6,6 +6,7 @@ recognition, from a webcam that sees you.
     python scripts/live.py                              # everything: both arms, hands, legs, core, head, face
     python scripts/live.py --torso desk                 # seated at a desk, hips hidden
     python scripts/live.py --side right                 # one arm only
+    python scripts/live.py --gaze-dwell 1.0             # also lock a target by looking at it for 1 s
 POV mode: hands only, for a head-mounted camera (goggles). Hand position and orientation, finger joints.
     python scripts/live.py --mode pov --hand right --fov 70
 
@@ -20,6 +21,8 @@ Keys (click the video window first):
     h  body: set the current head pose as zero for relative head motion
     e  body: enroll your face for recognition, under --name (press a few times from different angles)
     k  body: calibrate the emotion tracker to your face: make each expression when asked (about 30 s)
+    g  body: calibrate eye tracking: look at each red dot until it moves (9 dots, about 20 s)
+    t  body: lock onto (or release) the spot you are looking at; a pinch with either hand does the same
     f  cycle the finger joint table (off, then each tracked hand)
     c  body: print axis and hand/pose agreement checks to the terminal
     w  toggle the wireframe overlay
@@ -62,18 +65,23 @@ def parse_args(argv=None) -> Config:
     ap.add_argument("--no-emotion", action="store_true", help="body mode: turn off emotion and face recognition")
     ap.add_argument("--emotion-model", choices=["hsemotion", "opencv"], default="hsemotion",
                     help="emotion model: hsemotion (default, much better at fear) or opencv (the first one)")
+    ap.add_argument("--gaze-dwell", type=float, default=0.0,
+                    help="body mode: lock a target by looking at one spot this many seconds (0 = off; "
+                         "use key t or a pinch)")
     ap.add_argument("--name", default="me", help="name stored when you enroll your face (key e)")
     ap.add_argument("--faces-dir", default="faces", help="where enrolled faces are stored")
     ap.add_argument("--model-dir", default="models", help="where model files are downloaded")
     ap.add_argument("--window-width", type=int, default=1600, help="maximum window width in pixels")
     ap.add_argument("--record", type=Path, help="write per-update values to CSV")
     a = ap.parse_args(argv)
+    if a.gaze_dwell < 0:
+        ap.error("--gaze-dwell must be 0 or more")
     if not a.name.replace("-", "").replace("_", "").isalnum():
         ap.error("--name may contain only letters, digits, - and _")
     return Config(mode=a.mode, camera=a.camera, width=a.width, height=a.height, fps=a.fps, side=a.side,
                   torso=a.torso, pose_model=a.pose_model, smoothing=a.smoothing, pose_only_wrist=a.pose_only_wrist,
                   hand=a.hand, swap_hands=a.swap_hands, fov=a.fov, face=not a.no_face, emotion=not a.no_emotion,
-                  emotion_model=a.emotion_model,
+                  emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
                   record=a.record)
 
