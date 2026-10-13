@@ -149,6 +149,8 @@ class GazeCalibrationSession:
 
     def phase(self, t: float) -> tuple[int, str, float]:
         dt = t - self.t0
+        if dt < 0:                                      # a frame captured before the calibration started
+            return 0, "settle", self.settle - dt
         if dt >= self.duration:
             return len(self.targets), "done", 0.0
         i = int(dt // (self.settle + self.capture))

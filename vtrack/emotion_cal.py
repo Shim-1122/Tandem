@@ -169,6 +169,8 @@ class CalibrationSession:
     def phase(self, t: float) -> tuple[int, str, float]:
         """(expression index, "prepare" | "capture" | "done", seconds left in this phase)."""
         dt = t - self.t0
+        if dt < 0:                                      # a frame captured before the calibration started
+            return 0, "prepare", self.prep - dt
         if dt >= self.duration:
             return len(self.order), "done", 0.0
         i = int(dt // (self.prep + self.cap))

@@ -60,6 +60,8 @@ def test_session_timing_prompts_and_capture():
     assert s.phase(101.5)[:2] == (0, "capture") and "recording" in s.prompt(101.5)
     assert s.phase(103.5)[:2] == (1, "prepare") and "HAPPY" in s.prompt(103.5)
     assert not s.add(np.zeros(7), 100.2)                     # getting ready: not recorded
+    assert s.phase(99.5)[:2] == (0, "prepare")                # captured before the start: not recorded either
+    assert not s.add(np.zeros(7), 99.5) and "NEUTRAL" in s.prompt(99.5)
     assert s.add(np.zeros(7), 101.2) and s.add(np.zeros(7), 102.9)
     assert s.counts()["neutral"] == 2 and s.counts()["happy"] == 0
     assert not s.finished(120.9) and s.finished(121.0) and s.phase(130)[1] == "done"

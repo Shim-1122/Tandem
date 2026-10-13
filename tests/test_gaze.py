@@ -161,6 +161,8 @@ def test_calibration_needs_enough_dots():
     s = GazeCalibrationSession(calibration_targets(W, H), 10.0, 1.0, 1.0)
     assert s.phase(10.5)[:2] == (0, "settle") and s.phase(11.5)[:2] == (0, "capture")
     assert not s.add(np.zeros(2), 0.6, 10.5) and not s.add(None, 0.6, 11.5) and s.add(np.zeros(2), 0.6, 11.5)
+    # a frame captured just before the calibration started is not a sample (it would count as the last dot)
+    assert s.phase(9.9)[:2] == (0, "settle") and not s.add(np.zeros(2), 0.6, 9.9)
 
 
 def test_fit_affine_is_exact_for_an_affine_map():
