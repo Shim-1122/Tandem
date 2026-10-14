@@ -90,6 +90,8 @@ class Config:
     pose_workers: int = 1              # instances of the body model
     display_hz: float = 60.0           # redraw the window at most this often; tracking and recording run at full rate
     gpu: bool = False                  # MediaPipe models on the graphics processor (Linux and macOS; falls back to CPU)
+    sim: bool = False                  # show the simulated robot (MuJoCo) copying you, in a second window
+    sim_camera: str = "front"          # front | side | top | eyes (the robot's view)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
     model_dir: str = "models"
@@ -273,7 +275,12 @@ class App:
         self.want_check = self.want_calib = False
         self.message, self.message_t = "", 0.0
         self.writer, self._csv_file = None, None
+        self.sim, self._sim_t = None, None
         try:
+            if cfg.sim:
+                from .sim import TandemSim
+                arm = cfg.hand if self.pov else (cfg.side if cfg.side != "both" else "right")
+                self.sim = TandemSim(hand_side=arm)
             if cfg.record:
                 self._open_csv(cfg.record)
         except BaseException:
@@ -973,6 +980,10 @@ class App:
             self._toggle_target("key t")
         elif k == "o":
             self.show_objects = not self.show_objects
+        elif k == "v" and self.sim is not None:
+            views = ["front", "side", "top", "eyes"]
+            self.cfg.sim_camera = views[(views.index(self.cfg.sim_camera) + 1) % len(views)]
+            self.say(f"robot view: {self.cfg.sim_camera}")
         elif k == "e":
             task = self.fns.get("emotion")
             if task is None:
@@ -987,6 +998,10 @@ class App:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._csv_file = open(path, "w", newline="", encoding="utf-8")
         self.writer = csv.writer(self._csv_file)
+        self.writer.writerow(self.csv_columns())
+
+    def csv_columns(self) -> list:
+        """Names of the recorded values, in CSV order (the simulator reads the same names)."""
         if self.pov:
             cols = ["t", "gesture", "x_m", "y_m", "z_m", "dx_cm", "dy_cm", "dz_cm", "twist", "pitch", "yaw"] + FINGER_COLS
             cols += GRASP_COLS + ["objects_seen"]
@@ -1008,7 +1023,7 @@ class App:
                 p = sd[0].upper() + "_" if len(self.sides) > 1 else ""
                 cols += [p + c for c in GRASP_COLS]
             cols.append("objects_seen")
-        self.writer.writerow(cols)
+        return cols
 
     def grasp_row(self, sd):
         nan = float("nan")
@@ -1024,19 +1039,29 @@ class App:
     def write_row(self, t):
         if self.writer is None:
             return
+        row = self.csv_values(t)
+        if row is not None:
+            self.writer.writerow(row)
+
+    def values(self, t=None) -> dict:
+        """The current recorded values by column name ({} until there is something to report)."""
+        row = self.csv_values(self.data_t or 0.0 if t is None else t)
+        return dict(zip(self.csv_columns(), row)) if row is not None else {}
+
+    def csv_values(self, t):
+        """One CSV row of the current values, or None when there is nothing to record yet."""
         nan = float("nan")
         if self.pov:
             sd = self.cfg.hand
             info = self.pov_info
             if info is None:
-                return
+                return None
             rel = info["rel"]
             fv = flat(self.fingers[sd]) if sd in self.fingers else {}
-            self.writer.writerow([f"{t:.3f}", self.gestures[sd], *np.round(info["t"], 4),
-                                  *([round(v, 2) for v in (rel.dx_cm, rel.dy_cm, rel.dz_cm, rel.twist, rel.pitch, rel.yaw)]
-                                    if rel else [nan] * 6), *[round(fv.get(c, nan), 1) for c in FINGER_COLS],
-                                  *self.grasp_row(sd), self.objects_seen()])
-            return
+            return [f"{t:.3f}", self.gestures[sd], *np.round(info["t"], 4),
+                    *([round(v, 2) for v in (rel.dx_cm, rel.dy_cm, rel.dz_cm, rel.twist, rel.pitch, rel.yaw)]
+                      if rel else [nan] * 6), *[round(fv.get(c, nan), 1) for c in FINGER_COLS],
+                    *self.grasp_row(sd), self.objects_seen()]
         row = [f"{t:.3f}"]
         for sd in self.sides:
             a = self.angs[sd]
@@ -1064,7 +1089,7 @@ class App:
         for sd in self.sides:
             row += self.grasp_row(sd)
         row.append(self.objects_seen())
-        self.writer.writerow(row)
+        return row
 
     # ------------------------------------------------------------------ loop
     def step(self, frame):
@@ -1091,12 +1116,30 @@ class App:
                 if now - self._last_render >= 1.0 / max(1.0, self.cfg.display_hz):
                     self._last_render = now         # the window only needs the screen's rate
                     show(self.render(frame))
+                    if self.sim is not None:
+                        cv2.imshow("Tandem robot", self.sim_frame(now))
                     if not self.handle_key(waitkey()):
                         break
         finally:
             self.close()
 
+    def sim_frame(self, now: float, width: int = 640, height: int = 480):
+        """Send the current angles to the simulated robot, run its physics up to now, and draw it (BGR)."""
+        sim = self.sim
+        sim.command(self.values())
+        if self._sim_t is not None:
+            sim.step(now - self._sim_t)
+        self._sim_t = now
+        img = np.ascontiguousarray(sim.render(self.cfg.sim_camera, width, height)[:, :, ::-1])
+        err = sim.errors()
+        worst = max(err, key=lambda a: abs(err[a]))
+        self.cv2.putText(img, f"view {self.cfg.sim_camera} (v)   largest lag {worst} {err[worst]:+.0f} deg",
+                         (10, 24), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, self.cv2.LINE_AA)
+        return img
+
     def close(self):
+        if self.sim is not None:
+            self.sim.close()
         stop_all(list(self.workers.values()) + [self.camera])
         for fn in self._all_fns():
             close = getattr(fn, "close", None)

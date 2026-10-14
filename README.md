@@ -9,7 +9,9 @@ the rest is ready for the parts of the humanoid that come after it.
 
 > **Status: the Homunculus arm is not built yet.** It is a planned build, and the first step toward a full
 > humanoid. This repository is the vision side only: it tracks a person and turns that into joint angles,
-> gestures, gaze targets and grip forces ready for the arm, but nothing here has driven real hardware yet.
+> gestures, gaze targets and grip forces ready for the arm, but nothing here has driven real hardware yet. The
+> robot does exist in simulation: a MuJoCo model of the planned upper body copies you live (see
+> [Robot simulation](#robot-simulation-mujoco)).
 
 **85 tracked degrees of freedom from one camera:** 7 per arm (14), 21 per hand (42), 10 per leg (20), 3 in the
 core and 6 for the head, plus 2 eye angles, 16 hand gestures, 7 emotion scores, and grasps of 16 everyday
@@ -35,6 +37,7 @@ recording, with a module that maps angles to 0..1 actuator commands with limits 
 - [What the camera cannot tell you](#what-the-camera-cannot-tell-you)
 - [Recording (CSV columns)](#recording-csv-columns)
 - [For the arm: what is ready and what is not](#for-the-arm-what-is-ready-and-what-is-not)
+- [Robot simulation (MuJoCo)](#robot-simulation-mujoco)
 - [Verify on your camera first](#verify-on-your-camera-first)
 - [Project layout](#project-layout), [Models](#models), [Tests](#tests), [Troubleshooting](#troubleshooting)
 
@@ -75,7 +78,7 @@ connection the first time.
    | `.venv\Scripts\python -m pip install -r requirements.txt` | `.venv/bin/python -m pip install -r requirements.txt` |
 
 5. **Check it** (no camera needed, about a minute): `.venv\Scripts\python -m pytest` on Windows,
-   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `221 passed`.
+   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `230 passed`.
 6. **Run it:** `.venv\Scripts\python scripts\live.py` on Windows, `.venv/bin/python scripts/live.py` on Mac or
    Linux. The first run downloads about 40 MB of models into `models/` and unpacks the object model (about a
    second). On a Mac, the first run asks for camera access: allow it for Terminal (System Settings > Privacy &
@@ -97,6 +100,8 @@ python scripts/live.py --gaze-dwell 1.0                 # also lock a target by 
 python scripts/live.py --object-model small             # faster object detection for slower computers
 python scripts/live.py --fast                           # highest tracking rate (up to 250 fps with a fast camera)
 python scripts/live.py --record recordings/run1.csv     # save every update to a CSV file
+python scripts/live.py --sim                            # also show the simulated robot copying you
+python scripts/sim.py --csv recordings/run1.csv         # replay a recording on the simulated robot
 ```
 
 ## The window
@@ -147,6 +152,7 @@ Click the video window first so it receives the keys.
 | `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
 | `w` | toggle the wireframe |
 | `o` | show or hide the object boxes |
+| `v` | with `--sim`: switch the robot view (front, side, top, the robot's own eyes) |
 
 ## Command-line options
 
@@ -178,6 +184,8 @@ Click the video window first so it receives the keys.
 | `--gpu` | off | run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU on its own) |
 | `--window-width PIXELS` | `1600` | maximum window width |
 | `--record FILE.csv` | off | save every update to a CSV file (see [Recording](#recording-csv-columns)) |
+| `--sim` | off | also open a window with the simulated robot copying you (see [Robot simulation](#robot-simulation-mujoco)) |
+| `--sim-camera front` / `side` / `top` / `eyes` | `front` | the robot window's first view (`v` switches) |
 
 `python scripts/live.py --help` prints the same list.
 
@@ -743,9 +751,79 @@ Ready, from the vision side:
 
 Not done yet, and needed once the arm exists:
 - A pressure calibration curve per air muscle, to turn 0..1 commands into pressure setpoints.
-- Matching the arm's joint axes and rotation order (the shoulder is Z-X-Y here) to the physical build.
+- Matching the physical build's joint axes and rotation order to the simulated robot, which already matches the
+  tracker (the shoulder is Z-X-Y).
 - Measuring the hand's real strongest grip and checking the grip forces with a force sensor.
 - Checking every angle against a goniometer or a leader arm before any closed-loop control.
+
+## Robot simulation (MuJoCo)
+
+![The simulated Tandem robot waving, from the front and the side](docs/tandem_sim.jpg)
+
+Before any hardware exists, the robot is modeled in [MuJoCo](https://mujoco.org), the physics simulator, as the
+planned upper body: the arm that comes first, then the T-bar spine and collarbone with a second arm, the neck and
+head, and a waist that turns on a slewing bearing. It copies you live, replays recordings, and saves videos.
+
+```
+python scripts/live.py --sim                       # track yourself and watch the robot copy you (key v: views)
+python scripts/sim.py                              # the robot alone, running a demo, in the 3D viewer
+python scripts/sim.py --csv recordings/run1.csv    # replay a recording (--speed 0.5 for half speed)
+python scripts/sim.py --video robot.mp4            # save a video instead (--camera eyes: what the robot sees)
+python scripts/sim.py --save-xml tandem.xml        # the model file, to open in MuJoCo's own tools
+```
+
+On a Mac, the interactive viewer needs MuJoCo's launcher: `mjpython scripts/sim.py` (installed with the
+`mujoco` package; `--sim` in the live app and `--video` work with plain `python`).
+
+**Joints first, muscles next.** Stage 1, this model, moves every joint with a position servo, so the robot's
+shape, joint axes and ranges can be checked against the tracker. Stage 2 swaps the arm, hand and waist servos for
+air muscles: pairs that pull against each other (agonist and antagonist) as tendons over a pulley at each joint,
+with force set by pressure and how far the muscle has contracted. The head stays on electric motors.
+
+| Part | Joints (66 in all) | Stage 1 drive | Planned drive |
+| --- | --- | --- | --- |
+| Waist | `core_rotation` (turn only) | servo, up to 120 N m | two opposing air muscles around a pulley |
+| Each arm | shoulder flexion, abduction, rotation; elbow; forearm rotation; wrist flexion and deviation (7) | servos, up to 80 N m at the shoulder | air muscles |
+| Each hand | 4 per finger (MCP flexion and side swing, PIP, DIP) and 5 for the thumb (21) | servos, up to 1.5 N m | air muscles in the forearm, tendons to the fingers |
+| Neck | yaw, pitch, roll (3) | hobby servos, about 25 kg cm | the same (motors, for weight and simplicity) |
+| Eyes | yaw and pitch, both eyes linked (one servo each) | micro servos | the same |
+| Eyelids | one blink joint, both lids linked | micro servo | the same |
+
+The head follows a Will Cogley style animatronic design: motors instead of muscles, for low weight and easy
+wiring. Each linked pair (both eyes' yaw, both eyes' pitch, both lids) is driven by one servo through a linkage,
+so the model has 63 servos for its 66 joints. There is a camera between the eyes: the `eyes` view (`--camera eyes` in `scripts/sim.py`).
+
+**It speaks the tracker's language.** Every joint is named after its CSV column (`R_shoulder_flexion`,
+`L_index_pip`, `core_rotation`, `neck_yaw`, ...) and turns the same way: a positive angle means what it means
+in [the sign tables](#arms-joint-angles). The tests check this exactly: for random poses of both arms and hands,
+the simulated elbow, wrist, knuckles and all ten fingertips land within 0.01 mm of where the tracker's own forward
+kinematics put them. Recordings of one arm, or from the POV camera (no `L_` or `R_` in the column names), drive
+the arm chosen with `--hand-side` (the tracked arm in the live app).
+
+What the robot does with the values:
+- **Missing values** (a hand out of view, no face) hold the last target, so the robot freezes rather than drops.
+- **Out-of-range values** are clipped to the joint's range (for example the elbow to 0 to 150 degrees).
+- **Blinks:** `eyes_open` = 0 closes the lids, but only while the face is seen (a lost face is not a blink).
+- **Not built:** core lean and side bend are tracked but the robot's waist only turns; the legs are tracked for
+  a later stage.
+
+Physics: real gravity, masses from the part sizes (an arm with its hand of about 4 kg, a printed head of about 1 kg), and
+torque limits per servo. Holding an arm straight out to the side, the shoulder sags about 1 degree below its
+target; any pose is reached within 2 degrees in under a second (tested). The robot touches the table and the
+tennis ball, but its own parts pass through each other (no self-collision yet). The live window prints the
+joint lagging furthest behind you.
+
+Sizes: upper arm 30 cm, forearm 26 cm, wrist to middle knuckle 9 cm, shoulders 40 cm apart, waist 95 cm above
+the floor. The hand is an average adult hand (in `NOMINAL_HAND` in `vtrack/sim.py`); change these to the real
+build's measurements once it exists.
+
+Next steps for the model:
+1. Air muscles: replace each servo with an antagonistic pair of tendons over a pulley, and a muscle force curve
+   (pressure times a function of contraction, from a datasheet such as Festo's fluidic muscles), driven by
+   pressure commands.
+2. The real hand's geometry and tendon routing, then grasping the tennis ball with the grip force from
+   [Grasp tracking](#grasp-tracking-objects-what-each-hand-holds-and-the-grip-force).
+3. Self-collision, so the arms cannot pass through the chest.
 
 ## Verify on your camera first
 
@@ -800,17 +878,20 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | `vtrack/filters.py` | One Euro landmark and joint-angle smoothing, smoothing presets, jitter meter |
 | `vtrack/gestures.py` | 16 rule-based hand gestures and a time-based filter that removes flicker |
 | `vtrack/mapping.py` | Angle to 0..1 command mapping and a slew-rate limiter |
+| `vtrack/sim.py` | The robot in MuJoCo: the model (built in code, mirrored for the left side), driving it from tracker values, physics and pictures |
 | `scripts/live.py` | Starts the live app from the command line (options listed with `--help`) |
+| `scripts/sim.py` | The simulated robot on its own: demo, recording replay, videos, the model file |
 | `scripts/object_vocab.py` | Rebuilds the object list after editing `vtrack/data/object_prompts.json` |
 | `scripts/eval_stability.py` | Jitter and lag of each smoothing preset on simulated noisy landmarks |
 
 | Folder or file | Contents |
 | --- | --- |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
-| `tests/` | 221 automated tests (see [Tests](#tests)) |
+| `tests/` | 230 automated tests (see [Tests](#tests)) |
+| `docs/` | the picture of the simulated robot |
 | `models/` | downloaded and unpacked models (created on first run; not in git) |
 | `faces/` | enrolled faces and emotion calibrations (created when you enroll; not in git) |
-| `requirements.txt` | numpy, mediapipe, opencv-python, onnxruntime, certifi, pytest |
+| `requirements.txt` | numpy, mediapipe, opencv-python, onnxruntime, certifi, mujoco, pytest |
 
 ## Models
 
@@ -833,11 +914,11 @@ publishing the repository or shipping it in a product would bring in the AGPL's 
 ## Tests
 
 ```
-python -m pytest            # all 221 tests, about a minute, no camera needed
+python -m pytest            # all 230 tests, about a minute, no camera needed
 python -m pytest -k grasp   # just one area
 ```
 
-All 221 pass on Python 3.9 and 3.13. Covered: kinematics round trips for both arms and both legs and the core
+All 230 pass on Python 3.13 (on 3.9 without MuJoCo installed, the 9 robot tests are skipped). Covered: kinematics round trips for both arms and both legs and the core
 (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted camera, PnP hand
 position recovery, all gestures in random orientations for both hands, head pose round trips, eye angles and gaze
 points (exact for random head poses), gaze calibration that survives head motion, target locking, emotion
@@ -846,7 +927,9 @@ known corrections), object detector decoding with known boxes in the whole frame
 the stored models (checksum, sizes), the grip force formula and its limits, object tracking (label vote, aging,
 carrying), the grasp state machine (touch, hold, carry, release, hidden object), the threaded pipeline, and the
 whole app with simulated models, including a full emotion calibration, a full gaze calibration followed by locking
-a target with a key and with pinches, and holding an object in body and POV modes. The app was also run headless
+a target with a key and with pinches, and holding an object in body and POV modes; and the simulated robot (its joints against the tracker's
+kinematics for both arms and hands, every tracked angle reaching a joint, holding and clipping values, the servos
+under gravity, and the live app driving it). The app was also run headless
 with the real models on photos (body, both arms, hidden elbows, a full-body yoga pose, POV with thumbs up, peace,
 pointing and open hands; the eyes of a portrait looking into the camera read yaw 0 and pitch 5 degrees, and a gaze
 calibration on a still photo was correctly refused; a woman holding up a phone read as her left hand holding a

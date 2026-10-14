@@ -10,6 +10,7 @@ webcam that sees you.
     python scripts/live.py --gaze-dwell 1.0             # also lock a target by looking at it for 1 s
     python scripts/live.py --object-model small         # faster object detection for slower computers
     python scripts/live.py --fast                       # highest tracking rate (up to 250 fps with a fast camera)
+    python scripts/live.py --sim                        # also show the simulated robot copying you (MuJoCo)
 POV mode: hands only, for a head-mounted camera (goggles). Hand position and orientation, finger joints,
 and grasp tracking.
     python scripts/live.py --mode pov --hand right --fov 70
@@ -31,6 +32,7 @@ Keys (click the video window first):
     c  body: print axis and hand/pose agreement checks to the terminal
     w  toggle the wireframe overlay
     o  show or hide the object boxes
+    v  with --sim: switch the robot view (front, side, top, the robot's own eyes)
 """
 from __future__ import annotations
 
@@ -96,6 +98,10 @@ def parse_args(argv=None) -> Config:
                     help="redraw the window at most this often; tracking and recording always run at full rate")
     ap.add_argument("--gpu", action="store_true",
                     help="run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU)")
+    ap.add_argument("--sim", action="store_true",
+                    help="also show the Tandem robot in MuJoCo copying you, in a second window (pip install mujoco)")
+    ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes"], default="front",
+                    help="first robot view (key v switches)")
     a = ap.parse_args(argv)
     cores = os.cpu_count() or 2
     if a.fast:                                       # the preset fills in only what was not given
@@ -123,7 +129,7 @@ def parse_args(argv=None) -> Config:
                   object_model=a.object_model, max_grip_n=a.max_grip_n,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
                   record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz,
-                  gpu=a.gpu)
+                  gpu=a.gpu, sim=a.sim, sim_camera=a.sim_camera)
 
 
 def fast_workers(cores: int, model: str) -> int:
