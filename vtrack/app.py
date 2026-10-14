@@ -30,7 +30,7 @@ from .legs import (CAMERA_UP, CORE_FIELDS, LEG_FIELDS, CoreAngles, LegAngles, Le
                    core_visible, leg_out_of_range, legs_visible, up_from_standing)
 from .kinematics import (_SIDE, ArmAngles, ArmKinematics, frame_agreement_deg, out_of_range, thorax_frame,
                          up_from_neutral)
-from .pipeline import BackgroundGate, CameraReader, ModelWorker, stop_all
+from .pipeline import BackgroundGate, CameraReader, ModelWorker, WorkerGroup, stop_all
 from .tracker import FrameResult, assign_hands
 
 ANGLE_FIELDS = ["shoulder_flexion", "shoulder_abduction", "shoulder_rotation", "elbow_flexion",
@@ -86,6 +86,10 @@ class Config:
     object_every_s: float = 0.6        # search the whole frame this often; otherwise only around the hands
     max_grip_n: float = 50.0           # the robot hand's strongest grip (scales the 0..1 grip command)
     cores: int | None = None           # CPU cores to plan for (default: all)
+    hand_workers: int = 1              # instances of the hand model on alternate frames (more = higher rate)
+    pose_workers: int = 1              # instances of the body model
+    display_hz: float = 60.0           # redraw the window at most this often; tracking and recording run at full rate
+    gpu: bool = False                  # MediaPipe models on the graphics processor (Linux and macOS; falls back to CPU)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
     model_dir: str = "models"
@@ -130,12 +134,12 @@ def default_models(cfg: Config, size):
     from .tracker import FaceModel, HandModel, PoseModel
     w, h = size
     K = camera_matrix(w, h, cfg.fov)
-    makers = {"hand": lambda: _call(HandModel(num_hands=2, model_dir=cfg.model_dir))}
+    makers = {"hand": lambda: _call(HandModel(num_hands=2, model_dir=cfg.model_dir, gpu=cfg.gpu))}
     if cfg.mode == "body":
-        makers["pose"] = lambda: _call(PoseModel(f"pose_{cfg.pose_model}", cfg.model_dir))
+        makers["pose"] = lambda: _call(PoseModel(f"pose_{cfg.pose_model}", cfg.model_dir, gpu=cfg.gpu))
         if cfg.face:
             def face():
-                fm, est = FaceModel(cfg.model_dir), HeadPoseEstimator()
+                fm, est = FaceModel(cfg.model_dir, gpu=cfg.gpu), HeadPoseEstimator()
 
                 def run(frame):
                     L = fm.process(frame.rgb, frame.t)
@@ -182,26 +186,31 @@ class App:
         self.size = (first.bgr.shape[1], first.bgr.shape[0])
         self.K = camera_matrix(self.size[0], self.size[1], cfg.fov)
         makers = models if models is not None else default_models(cfg, self.size)
-        self.fns = {}
+        self.fns, self.more_fns = {}, {}         # more_fns: extra instances of a model (WorkerGroup)
+        counts = {"hand": cfg.hand_workers, "pose": cfg.pose_workers}
         try:
             for name, make in makers.items():
                 self.fns[name] = make()
+                self.more_fns[name] = [make() for _ in range(max(1, counts.get(name, 1)) - 1)]
         except BaseException:
             self.camera.stop()
-            for fn in self.fns.values():
+            for fn in self._all_fns():
                 getattr(fn, "close", lambda: None)()
             raise
         # Hands and body are the priority and run as fast as they can; face and emotion use the cores left
         # free, with a guaranteed minimum rate (see pipeline.py), and are capped so they never need more.
         priority = [n for n in self.fns if n in ("hand", "pose")]
-        self.gate = BackgroundGate(len(priority), cfg.cores)
+        self.gate = BackgroundGate(sum(1 + len(self.more_fns[n]) for n in priority), cfg.cores)
         caps = {"face": cfg.face_hz, "emotion": cfg.emotion_hz, "objects": cfg.object_hz}
         floors = {"face": cfg.face_min_hz, "emotion": cfg.emotion_min_hz, "objects": cfg.object_min_hz}
-        self.workers = {name: ModelWorker(name, self.camera, fn, max_hz=caps.get(name) or None,
-                                          gate=None if name in priority else self.gate,
-                                          min_hz=floors.get(name, 5.0))
-                        for name, fn in self.fns.items()}
+        self.workers = {}
+        for name, fn in self.fns.items():
+            kw = dict(max_hz=caps.get(name) or None, gate=None if name in priority else self.gate,
+                      min_hz=floors.get(name, 5.0))
+            self.workers[name] = (WorkerGroup(name, self.camera, [fn] + self.more_fns[name], **kw)
+                                  if self.more_fns[name] else ModelWorker(name, self.camera, fn, **kw))
         self._seen = {name: _Cache() for name in self.workers}
+        self._last_render = -1e9
         self._arm_t = self._hand_t = -1.0
         self.data_t = None            # capture time of the newest result used (for the CSV)
 
@@ -274,45 +283,73 @@ class App:
             w.start()
 
     # ------------------------------------------------------------------ results
-    def _new(self, name):
+    def _all_fns(self):
+        return list(self.fns.values()) + [f for fs in self.more_fns.values() for f in fs]
+
+    def _new_results(self, name) -> list:
+        """Results of model `name` not used yet, oldest first (several when the model runs as a group)."""
         w = self.workers.get(name)
         if w is None:
-            return None
-        r = w.get()
-        if r is None or r.frame_index == self._seen[name].index:
-            return None
-        self._seen[name].index = r.frame_index
-        return r
+            return []
+        seen = self._seen[name].index
+        if isinstance(w, WorkerGroup):
+            rs = w.new_results(seen)
+        else:
+            r = w.get()
+            rs = [r] if r is not None and r.frame_index > seen else []
+        if rs:
+            self._seen[name].index = rs[-1].frame_index
+        return rs
 
     def update(self) -> bool:
-        """Consume new worker results; True when any arrived."""
-        hand_r, pose_r, face_r, emo_r, obj_r = (self._new(n) for n in ("hand", "pose", "face", "emotion", "objects"))
-        if obj_r is not None:
-            for region, dets in obj_r.value["runs"]:
-                self.obj_tracker.update(dets, obj_r.t_capture, region=region)
-        if pose_r is not None:
-            self.pose_res = pose_r
-            if pose_r.value is not None:
-                self.pose_w = self.pose_smooth(pose_r.value.world, pose_r.t_capture)
-        if hand_r is not None:
-            self._hand_t = hand_r.t_capture
-            self._update_hands(hand_r)
-        if not self.pov and pose_r is not None:
-            self._update_legs(pose_r.t_capture)
-        if not self.pov and (pose_r is not None or hand_r is not None) and self.pose_res is not None:
-            # The arm combines the newest body and the newest hand result; its time is the newer of the two,
-            # and it is solved only when that time advances (the filters need increasing timestamps).
-            t = max(self.pose_res.t_capture, self._hand_t)
-            if t > self._arm_t:
-                self._arm_t = t
-                self._update_arms(t)
-        if face_r is not None:
-            self._update_head(face_r)
-        if emo_r is not None:
-            self._update_emotion(emo_r)
-        if self.want_calib and not self.pov and pose_r is not None:
-            self.want_calib = False
-            self._calibrate_body()
+        """Use every new worker result in capture order (one CSV row each when recording); True when any."""
+        order = {"objects": 0, "pose": 1, "hand": 2, "face": 3, "emotion": 4}
+        new = sorted(((r.t_capture, order[n], n, r) for n in order for r in self._new_results(n)),
+                     key=lambda x: x[:2])
+        for t, _, name, r in new:
+            self._apply(name, r)
+            self.data_t = t if self.data_t is None else max(self.data_t, t)
+            if self.writer is not None:
+                self.write_row(self.data_t)
+        self._after_results()
+        return bool(new)
+
+    def _apply(self, name, r):
+        """Use one model result."""
+        if name == "objects":
+            for region, dets in r.value["runs"]:
+                self.obj_tracker.update(dets, r.t_capture, region=region)
+        elif name == "pose":
+            self.pose_res = r
+            if r.value is not None:
+                self.pose_w = self.pose_smooth(r.value.world, r.t_capture)
+            if not self.pov:
+                self._update_legs(r.t_capture)
+                self._solve_arms()
+                if self.want_calib:
+                    self.want_calib = False
+                    self._calibrate_body()
+        elif name == "hand":
+            self._hand_t = r.t_capture
+            self._update_hands(r)
+            if not self.pov:
+                self._solve_arms()
+        elif name == "face":
+            self._update_head(r)
+        elif name == "emotion":
+            self._update_emotion(r)
+
+    def _solve_arms(self):
+        # The arm combines the newest body and the newest hand result; its time is the newer of the two, and
+        # it is solved only when that time advances (the filters need increasing timestamps).
+        if self.pose_res is None:
+            return
+        t = max(self.pose_res.t_capture, self._hand_t)
+        if t > self._arm_t:
+            self._arm_t = t
+            self._update_arms(t)
+
+    def _after_results(self):
         if self.cal_session is not None and self.cal_session.finished(time.monotonic() - 0.3):
             self._finish_emotion_calibration()
         if self.gaze_session is not None and self.gaze_session.finished(time.monotonic() - 0.2):
@@ -321,10 +358,6 @@ class App:
         if getattr(task, "message", ""):
             self.say(task.message)
             task.message = ""
-        new = [r for r in (hand_r, pose_r, face_r, emo_r, obj_r) if r is not None]
-        if new:
-            self.data_t = max([r.t_capture for r in new] + ([self.data_t] if self.data_t is not None else []))
-        return bool(new)
 
     def _update_hands(self, r):
         hands = r.value or []
@@ -1035,8 +1068,8 @@ class App:
 
     # ------------------------------------------------------------------ loop
     def step(self, frame):
-        if self.update() and self.data_t is not None:
-            self.write_row(self.data_t)
+        """Use the new results (and record them), then draw the window."""
+        self.update()
         return self.render(frame)
 
     def run(self, show=None, waitkey=None):
@@ -1053,15 +1086,19 @@ class App:
                         break
                     continue
                 last = frame.index
-                show(self.step(frame))
-                if not self.handle_key(waitkey()):
-                    break
+                self.update()                       # every result, at the full tracking rate
+                now = time.monotonic()
+                if now - self._last_render >= 1.0 / max(1.0, self.cfg.display_hz):
+                    self._last_render = now         # the window only needs the screen's rate
+                    show(self.render(frame))
+                    if not self.handle_key(waitkey()):
+                        break
         finally:
             self.close()
 
     def close(self):
         stop_all(list(self.workers.values()) + [self.camera])
-        for fn in self.fns.values():
+        for fn in self._all_fns():
             close = getattr(fn, "close", None)
             if close:
                 try:

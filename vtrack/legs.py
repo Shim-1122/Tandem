@@ -43,7 +43,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
-from .geometry import L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, unit
+from .geometry import cross3, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, unit
 from .kinematics import rot_x, rot_y, rot_z, thorax_frame
 
 L_KNEE, R_KNEE = 25, 26
@@ -69,7 +69,7 @@ def pelvis_frame(pose: np.ndarray, up: np.ndarray = CAMERA_UP):
     u = unit(np.asarray(up, dtype=float))
     y = unit(u - np.dot(u, z) * z)
     obliquity = float(np.arcsin(np.clip(np.dot(z, u), -1.0, 1.0)))
-    return np.column_stack([np.cross(y, z), y, z]), (pose[R_HIP] + pose[L_HIP]) / 2, obliquity
+    return np.column_stack([cross3(y, z), y, z]), (pose[R_HIP] + pose[L_HIP]) / 2, obliquity
 
 
 @dataclass
@@ -134,7 +134,7 @@ class LegKinematics:
         if np.linalg.norm(x) < 0.5 or np.linalg.norm(y) < 1e-3:
             return None
         y = unit(y)
-        return np.column_stack([x, y, np.cross(x, y)])
+        return np.column_stack([x, y, cross3(x, y)])
 
     def solve(self, pose: np.ndarray, up: np.ndarray = CAMERA_UP, foot: bool = True) -> LegAngles:
         """pose: (33, 3) world landmarks; up: up direction in the same axes; foot: heel and toe in view."""
@@ -150,12 +150,12 @@ class LegKinematics:
 
         beta = float(np.arcsin(np.clip(yt[2], -1.0, 1.0)))          # = -abduction
         near_pole = abs(yt[2]) > np.cos(np.radians(self.pole))
-        zt = np.cross(yt, sd)                                        # knee hinge axis, right
+        zt = cross3(yt, sd)                                        # knee hinge axis, right
         plane_ok = knee >= self.min_knee and np.linalg.norm(zt) > np.sin(np.radians(self.min_knee))
         R_meas = None
         if plane_ok:
             zt = unit(zt)
-            R_meas = np.column_stack([np.cross(yt, zt), yt, zt])
+            R_meas = np.column_stack([cross3(yt, zt), yt, zt])
 
         source = "held"
         if not near_pole:
@@ -209,7 +209,7 @@ class LegKinematics:
         if np.linalg.norm(x) < 0.3:
             return False
         x = unit(x)
-        R_shank = np.column_stack([x, y, np.cross(x, y)])
+        R_shank = np.column_stack([x, y, cross3(x, y)])
         self.foot_correction = R_foot.T @ R_shank
         return True
 

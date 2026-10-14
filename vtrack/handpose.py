@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from .geometry import FINGERS, finger_flexion, unit
+from .geometry import cross3, finger_flexion, FINGERS, unit
 from .kinematics import euler_yxz
 
 
@@ -35,7 +35,7 @@ def hand_frame(world: np.ndarray) -> np.ndarray:
     y = unit(world[0] - world[9])
     x = world[5] - world[17]
     x = unit(x - np.dot(x, y) * y)
-    return np.column_stack([x, y, np.cross(x, y)])
+    return np.column_stack([x, y, cross3(x, y)])
 
 
 def hand_pose_camera(world: np.ndarray, image_norm: np.ndarray, K: np.ndarray):

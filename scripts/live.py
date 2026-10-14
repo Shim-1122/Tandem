@@ -9,6 +9,7 @@ webcam that sees you.
     python scripts/live.py --side right                 # one arm only
     python scripts/live.py --gaze-dwell 1.0             # also lock a target by looking at it for 1 s
     python scripts/live.py --object-model small         # faster object detection for slower computers
+    python scripts/live.py --fast                       # highest tracking rate (up to 250 fps with a fast camera)
 POV mode: hands only, for a head-mounted camera (goggles). Hand position and orientation, finger joints,
 and grasp tracking.
     python scripts/live.py --mode pov --hand right --fov 70
@@ -34,6 +35,7 @@ Keys (click the video window first):
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -82,7 +84,32 @@ def parse_args(argv=None) -> Config:
     ap.add_argument("--model-dir", default="models", help="where model files are downloaded")
     ap.add_argument("--window-width", type=int, default=1600, help="maximum window width in pixels")
     ap.add_argument("--record", type=Path, help="write per-update values to CSV")
+    ap.add_argument("--fast", action="store_true",
+                    help="high frame rate preset: asks the camera for 250 fps at 640x480, runs several hand and body "
+                         "model instances on alternate frames, the lite body model, the small object model and no "
+                         "emotion model (any option you give yourself wins)")
+    ap.add_argument("--hand-workers", type=int, default=0,
+                    help="instances of the hand model on alternate frames (0 = automatic: 1, or more with --fast)")
+    ap.add_argument("--pose-workers", type=int, default=0,
+                    help="instances of the body model on alternate frames (0 = automatic)")
+    ap.add_argument("--display-hz", type=float, default=60.0,
+                    help="redraw the window at most this often; tracking and recording always run at full rate")
+    ap.add_argument("--gpu", action="store_true",
+                    help="run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU)")
     a = ap.parse_args(argv)
+    cores = os.cpu_count() or 2
+    if a.fast:                                       # the preset fills in only what was not given
+        given = {x.split("=")[0] for x in (argv if argv is not None else sys.argv[1:]) if x.startswith("--")}
+        for opt, attr, value in (("--fps", "fps", 250), ("--width", "width", 640), ("--height", "height", 480),
+                                 ("--pose-model", "pose_model", "lite"), ("--object-model", "object_model", "small")):
+            if opt not in given:
+                setattr(a, attr, value)
+        if "--no-emotion" not in given:
+            a.no_emotion = True
+    hand_workers = a.hand_workers or (fast_workers(cores, "hand") if a.fast else 1)
+    pose_workers = a.pose_workers or (fast_workers(cores, "pose") if a.fast else 1)
+    if a.hand_workers < 0 or a.pose_workers < 0 or a.display_hz <= 0:
+        ap.error("worker counts must be 0 or more and --display-hz more than 0")
     if a.max_grip_n <= 0:
         ap.error("--max-grip-n must be more than 0")
     if a.gaze_dwell < 0:
@@ -95,7 +122,15 @@ def parse_args(argv=None) -> Config:
                   emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell, objects=not a.no_objects,
                   object_model=a.object_model, max_grip_n=a.max_grip_n,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
-                  record=a.record)
+                  record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz,
+                  gpu=a.gpu)
+
+
+def fast_workers(cores: int, model: str) -> int:
+    """Model instances for --fast: hands get the most, and a few cores stay free for the camera, the face and
+    the main loop (the kinematics)."""
+    spare = max(0, cores - 3)
+    return max(1, min(4, spare * 2 // 3 if model == "hand" else spare // 3))
 
 
 def main(argv=None):

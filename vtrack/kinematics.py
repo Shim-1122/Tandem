@@ -45,7 +45,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
-from .geometry import (L_ELBOW, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST, unit)
+from .geometry import (L_ELBOW, cross3, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST, unit)
 
 # Pose landmark indices for the hand points MediaPipe pose provides (pinky, index) per side
 POSE_PINKY = {"left": 17, "right": 18}
@@ -70,7 +70,7 @@ def rot_z(a):
 
 def shortest_arc(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     """Rotation matrix taking unit vector a to unit vector b by the shortest path (Rodrigues)."""
-    v = np.cross(a, b)
+    v = cross3(a, b)
     c = float(np.dot(a, b))
     vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
     return np.eye(3) + vx + vx @ vx / (1.0 + c)
@@ -92,7 +92,7 @@ def thorax_frame(pose: np.ndarray, up_hint: np.ndarray | None = None) -> tuple[n
     mid_sh = (pose[R_SHOULDER] + pose[L_SHOULDER]) / 2
     y = mid_sh - (pose[R_HIP] + pose[L_HIP]) / 2 if up_hint is None else np.asarray(up_hint, dtype=float)
     y = unit(y - np.dot(y, z) * z)
-    x = np.cross(y, z)
+    x = cross3(y, z)
     return np.column_stack([x, y, z]), mid_sh
 
 
@@ -152,12 +152,12 @@ class ArmKinematics:
         out = ArmAngles(elbow_flexion=float(elbow))
         beta = float(np.arcsin(np.clip(yh[2], -1.0, 1.0)))       # coronal rotation, = -abduction
         near_pole = abs(yh[2]) > np.cos(np.radians(self.pole))
-        zh = np.cross(fd, yh)
+        zh = cross3(fd, yh)
         plane_ok = elbow >= self.min_elbow and np.linalg.norm(zh) > np.sin(np.radians(self.min_elbow))
         R_h = None
         if plane_ok:
             zh = unit(zh)
-            R_h = np.column_stack([np.cross(yh, zh), yh, zh])
+            R_h = np.column_stack([cross3(yh, zh), yh, zh])
 
         if not near_pole:
             phi = float(np.arctan2(-yh[0], yh[1]))                # sagittal rotation from the long axis
@@ -197,7 +197,7 @@ class ArmKinematics:
         x_hand = hx - np.dot(hx, y_hand) * y_hand
         if np.linalg.norm(y_hand) > 0 and np.linalg.norm(x_hand) > 1e-9:
             x_hand = unit(x_hand)
-            R_hand = np.column_stack([x_hand, y_hand, np.cross(x_hand, y_hand)])
+            R_hand = np.column_stack([x_hand, y_hand, cross3(x_hand, y_hand)])
             ps, fe, dev = euler_yxz(R_f.T @ R_hand)
             out.forearm_rotation, out.wrist_flexion, out.wrist_deviation = (float(np.degrees(v)) for v in (ps, fe, dev))
             out.wrist_valid = True
@@ -223,7 +223,7 @@ def frame_agreement_deg(pose: np.ndarray, hand: np.ndarray, side: str = "right")
         return float(np.degrees(np.arccos(np.clip(np.dot(unit(u), unit(v)), -1.0, 1.0))))
 
     return {"hand_vs_forearm_deg": ang(hand[9] - hand[0], pose[w_i] - pose[e_i]),
-            "long_axis_deg": ang(py, hy), "palm_normal_deg": ang(np.cross(px, py), np.cross(hx, hy))}
+            "long_axis_deg": ang(py, hy), "palm_normal_deg": ang(cross3(px, py), cross3(hx, hy))}
 
 
 def up_from_neutral(pose: np.ndarray, side: str = "right") -> np.ndarray:

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .geometry import L_ELBOW, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST
+from .geometry import cross3, L_ELBOW, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST
 from .kinematics import POSE_INDEX, POSE_PINKY, rot_x, rot_y, rot_z
 
 
@@ -102,7 +102,7 @@ def forward_body(legs: dict, core: dict | None = None, pelvic_hike: float = 0.0,
     o = np.radians(pelvic_hike)
     Z = np.cos(o) * right + np.sin(o) * U
     Y = -np.sin(o) * right + np.cos(o) * U
-    R_p = np.column_stack([np.cross(Y, Z), Y, Z])
+    R_p = np.column_stack([cross3(Y, Z), Y, Z])
     origin = np.asarray(body_offset, float)
     pose = np.zeros((33, 3))
     for side, ang in legs.items():

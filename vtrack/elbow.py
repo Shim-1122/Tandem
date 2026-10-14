@@ -29,6 +29,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .geometry import cross3
+
 UPPER_ARM_PER_SHOULDER_WIDTH = 0.186 / 0.259
 FOREARM_PER_SHOULDER_WIDTH = 0.146 / 0.259
 
@@ -98,8 +100,8 @@ class ElbowPredictor:
         r = float(np.sqrt(max(r2, 0.0)))
         C = S + a * n
         helper = np.array([1.0, 0.0, 0.0]) if abs(n[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        e1 = _unit(np.cross(n, helper))
-        e2 = np.cross(n, e1)
+        e1 = _unit(cross3(n, helper))
+        e2 = cross3(n, e1)
 
         def point(th):
             return C + r * (np.cos(th) * e1 + np.sin(th) * e2)

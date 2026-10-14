@@ -6,7 +6,7 @@ import pytest
 
 pytest.importorskip("cv2")
 
-from vtrack.pipeline import BackgroundGate, CameraReader, ModelWorker, RateMeter, stop_all
+from vtrack.pipeline import BackgroundGate, CameraReader, FrameClaim, ModelWorker, RateMeter, WorkerGroup, stop_all
 
 
 class FakeCap:
@@ -159,3 +159,36 @@ def test_worker_error_clears_after_recovery():
 def test_stop_all_accepts_threads_that_never_started():
     cam = CameraReader(FakeCap(fps=100))
     stop_all([ModelWorker("w", cam, lambda f: 1), cam])     # must not raise
+
+
+def _rate_with(count, seconds=1.2):
+    """A 25 ms model (40 Hz alone) on a 200 fps camera, run as `count` instances."""
+    cam = CameraReader(FakeCap(fps=200))
+    seen, lock = [], threading.Lock()
+
+    def model(frame):
+        time.sleep(0.025)                      # sleeping, like MediaPipe, lets the other instances run
+        with lock:
+            seen.append(frame.index)
+        return frame.index
+
+    g = WorkerGroup("hand", cam, [model] * count)
+    cam.start(); g.start()
+    time.sleep(seconds)
+    rate, results = g.meter.rate(), g.new_results(0)
+    stop_all([g, cam])
+    return rate, seen, results
+
+
+def test_a_worker_group_multiplies_the_rate_and_never_repeats_a_frame():
+    r1, _, _ = _rate_with(1)
+    r3, seen, results = _rate_with(3)
+    assert 30 < r1 < 45 and r3 > 2.4 * r1                 # three instances: about three times the results
+    assert len(seen) == len(set(seen))                     # each frame went to exactly one instance
+    assert [r.frame_index for r in results] == sorted(r.frame_index for r in results)
+    assert len(results) <= 3
+
+
+def test_frame_claim_takes_each_frame_once():
+    c = FrameClaim()
+    assert c.take(1) and not c.take(1) and c.take(3) and not c.take(2) and c.last == 3

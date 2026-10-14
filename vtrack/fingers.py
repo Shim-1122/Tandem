@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .geometry import unit
+from .geometry import cross3, unit
 from .kinematics import rot_x, rot_y, rot_z
 
 FINGERS4 = {"index": (5, 6, 7, 8), "middle": (9, 10, 11, 12), "ring": (13, 14, 15, 16), "pinky": (17, 18, 19, 20)}
@@ -47,7 +47,7 @@ def palm_frame(world: np.ndarray) -> np.ndarray:
     y = unit(world[0] - world[9])
     x = world[5] - world[17]
     x = unit(x - np.dot(x, y) * y)
-    return np.column_stack([x, y, np.cross(x, y)])
+    return np.column_stack([x, y, cross3(x, y)])
 
 
 def _finger_base(mcp_palm: np.ndarray) -> np.ndarray:
@@ -55,7 +55,7 @@ def _finger_base(mcp_palm: np.ndarray) -> np.ndarray:
     u = unit(mcp_palm)
     v = np.array([0.0, 0.0, -1.0])
     v = unit(v - np.dot(v, u) * u)
-    return np.column_stack([u, v, np.cross(u, v)])
+    return np.column_stack([u, v, cross3(u, v)])
 
 
 _THUMB_BASE = np.column_stack([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])

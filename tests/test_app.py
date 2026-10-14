@@ -431,3 +431,37 @@ def test_finger_tables_for_both_hands_shown_from_the_start():
         assert app.finger_lines()[0].startswith("left fingers\t") and "right fingers" in app.finger_lines()[0]
     finally:
         app.close()
+
+
+def test_several_hand_instances_feed_every_result_in_order(tmp_path):
+    """Three slow hand model instances: about three times the hand rate, each result used once, in capture
+    order, one CSV row each; and the window is drawn at the display rate, not the tracking rate."""
+    pose_w, pose_img, hand_w, hand_img = scene()
+
+    def slow_hand():
+        def run(frame):
+            time.sleep(0.02)
+            return [HandResult("Left", hand_w.copy(), hand_img.copy())]
+        return run
+    models = fake_models()
+    models["hand"] = slow_hand
+    rec = tmp_path / "fast.csv"
+    app = App(Config(cores=16, hand_workers=3, display_hz=10, record=rec), FakeCap(fps=200), models)
+    renders = []
+
+    hand_rate = []
+
+    def waitkey():
+        if len(renders) >= 12:
+            hand_rate.append(app.workers["hand"].meter.rate())
+            return ord("q")
+        return 255
+    t0 = time.monotonic()
+    app.run(show=lambda img: renders.append(time.monotonic()), waitkey=waitkey)
+    seconds = time.monotonic() - t0
+    rows = list(csv.reader(open(rec, encoding="utf-8")))[1:]
+    ts = [float(r[0]) for r in rows]
+    assert all(b >= a for a, b in zip(ts, ts[1:]))                  # capture order
+    assert len(renders) / seconds < 12                              # drawn at about 10 Hz
+    assert len(rows) / seconds > 5 * len(renders) / seconds         # recorded far faster than drawn
+    assert hand_rate[0] > 90                                           # 3 x (1 / 20 ms) = 150 at best

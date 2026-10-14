@@ -30,9 +30,8 @@ recording, with a module that maps angles to 0..1 actuator commands with limits 
   [Gestures](#gestures), [Legs and core](#legs-and-core-10-dof-per-leg-3-in-the-core)
 - Head and face: [Head](#head-6-dof-4-anchor-points), [Eyes](#eyes-gaze-and-target-locking),
   [Face recognition and emotion](#face-recognition-and-emotion)
-- [Grasp tracking: objects, what each hand holds, and the grip force](#grasp-tracking-objects-what-each-hand-
-  holds-and-the-grip-force)
-- [Speed and latency](#speed-and-latency), [Stability and smoothing](#stability-and-smoothing)
+- [Grasp tracking: objects, what each hand holds, and the grip force](#grasp-tracking-objects-what-each-hand-holds-and-the-grip-force)
+- [Speed and latency](#speed-and-latency), [High frame rates](#high-frame-rates-up-to-250-fps), [Stability and smoothing](#stability-and-smoothing)
 - [What the camera cannot tell you](#what-the-camera-cannot-tell-you)
 - [Recording (CSV columns)](#recording-csv-columns)
 - [For the arm: what is ready and what is not](#for-the-arm-what-is-ready-and-what-is-not)
@@ -76,7 +75,7 @@ connection the first time.
    | `.venv\Scripts\python -m pip install -r requirements.txt` | `.venv/bin/python -m pip install -r requirements.txt` |
 
 5. **Check it** (no camera needed, about a minute): `.venv\Scripts\python -m pytest` on Windows,
-   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `218 passed`.
+   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `221 passed`.
 6. **Run it:** `.venv\Scripts\python scripts\live.py` on Windows, `.venv/bin/python scripts/live.py` on Mac or
    Linux. The first run downloads about 40 MB of models into `models/` and unpacks the object model (about a
    second). On a Mac, the first run asks for camera access: allow it for Terminal (System Settings > Privacy &
@@ -96,6 +95,7 @@ python scripts/live.py --mode pov --hand right --fov 70 # head-mounted (POV) cam
 python scripts/live.py --name shyam                     # then press e to enroll your face as shyam
 python scripts/live.py --gaze-dwell 1.0                 # also lock a target by looking at it for 1 second
 python scripts/live.py --object-model small             # faster object detection for slower computers
+python scripts/live.py --fast                           # highest tracking rate (up to 250 fps with a fast camera)
 python scripts/live.py --record recordings/run1.csv     # save every update to a CSV file
 ```
 
@@ -172,6 +172,10 @@ Click the video window first so it receives the keys.
 | `--no-objects` | off | turn off object detection and grasp tracking |
 | `--object-model medium` / `small` | `medium` | object detector: medium is more accurate, small is 2 to 3 times faster |
 | `--max-grip-n NEWTONS` | `50` | the robot hand's strongest grip; grip commands are the force divided by this |
+| `--fast` | off | high frame rate preset (see [High frame rates](#high-frame-rates-up-to-250-fps)): 250 fps at 640x480 requested, several hand and body model instances, lite body model, small object model, no emotion model; options you give yourself win |
+| `--hand-workers N`, `--pose-workers N` | `0` (automatic) | instances of the hand or body model working on alternate frames; more instances, higher rate (needs the cores) |
+| `--display-hz HZ` | `60` | redraw the window at most this often; tracking and recording always run at the full rate |
+| `--gpu` | off | run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU on its own) |
 | `--window-width PIXELS` | `1600` | maximum window width |
 | `--record FILE.csv` | off | save every update to a CSV file (see [Recording](#recording-csv-columns)) |
 
@@ -620,6 +624,32 @@ ran at about 25 Hz alone and 15 to 18 Hz with the body, face and emotion models.
 brought it to 14 to 15 Hz on that computer; with the small object model and no emotion model it ran at 21 to 23
 Hz. With 4 or more cores the background models get cores of their own and no longer slow the hands.
 
+### High frame rates (up to 250 fps)
+
+`python scripts/live.py --fast` sets everything up for the highest tracking rate. Three things limit the rate, and
+each has its own fix:
+
+1. **The camera.** Tracking cannot be faster than the frames coming in. Most laptop webcams deliver 30 fps,
+   some 60; 250 fps needs a high-speed USB camera (many give 120 to 260 fps at 640x480 in MJPG). `--fast` asks
+   for 250 fps at 640x480, and `cam N fps` in the status line shows what the camera really gives. The models
+   work on small images inside anyway (the hand model measured the same time at 1280x720 and 640x360), so the
+   lower resolution costs no accuracy at normal distances.
+2. **One model instance.** A model that needs 10 ms per frame gives at most 100 results per second. `--fast`
+   runs several instances of the hand model (and, with enough cores, the body model), each taking the next frame
+   none of the others has taken, so the rates add up: on a 2-core test computer, two hand instances raised the
+   hand rate from 22 to 35 Hz; with 3 or 4 instances on 8 or more cores the rates multiply further. The number of
+   instances follows the processor's cores (`--hand-workers` and `--pose-workers` set them yourself). `--gpu`
+   moves the MediaPipe models to the graphics processor on Linux and macOS, which can shorten each frame a lot.
+3. **The main loop.** Every result is now used in capture order (and written to the recording as its own row),
+   while the window is only redrawn 60 times a second (`--display-hz`), because drawing the window costs more
+   than the kinematics. The kinematics take about 1.5 ms per hand result and 0.8 ms per body result on the test
+   computer, after replacing NumPy's general cross product (slow for single 3-vectors) with a direct one.
+
+So 250 fps of tracking needs a 250 fps camera, enough cores (or a GPU) for the hand model instances, and the
+lighter models `--fast` picks. Without such a camera, `--fast` still gives the highest rate the camera allows.
+The face, emotion and object models stay at their background rates, since faces and held objects do not need
+250 updates a second.
+
 If the hands are not smooth:
 1. **Light.** In a dim room most webcams lengthen the exposure and drop to 15 fps; check `cam N fps`. Light
    your hands well.
@@ -777,7 +807,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | Folder or file | Contents |
 | --- | --- |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
-| `tests/` | 218 automated tests (see [Tests](#tests)) |
+| `tests/` | 221 automated tests (see [Tests](#tests)) |
 | `models/` | downloaded and unpacked models (created on first run; not in git) |
 | `faces/` | enrolled faces and emotion calibrations (created when you enroll; not in git) |
 | `requirements.txt` | numpy, mediapipe, opencv-python, onnxruntime, certifi, pytest |
@@ -803,11 +833,11 @@ publishing the repository or shipping it in a product would bring in the AGPL's 
 ## Tests
 
 ```
-python -m pytest            # all 218 tests, about a minute, no camera needed
+python -m pytest            # all 221 tests, about a minute, no camera needed
 python -m pytest -k grasp   # just one area
 ```
 
-All 218 pass on Python 3.9 and 3.13. Covered: kinematics round trips for both arms and both legs and the core
+All 221 pass on Python 3.9 and 3.13. Covered: kinematics round trips for both arms and both legs and the core
 (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted camera, PnP hand
 position recovery, all gestures in random orientations for both hands, head pose round trips, eye angles and gaze
 points (exact for random head poses), gaze calibration that survives head motion, target locking, emotion

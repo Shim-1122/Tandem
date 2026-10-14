@@ -107,15 +107,29 @@ class _LandmarkTask:
     keeps the timestamps increasing, and closes it."""
 
     task_name = ""                      # HandLandmarker, PoseLandmarker or FaceLandmarker
+    gpu_failed = False                  # set once the graphics processor could not be used (then CPU for all)
 
-    def __init__(self, model_key: str, model_dir: str = "models", **options):
+    def __init__(self, model_key: str, model_dir: str = "models", gpu: bool = False, **options):
         from mediapipe.tasks import python as mpt
         from mediapipe.tasks.python import vision
         task = getattr(vision, self.task_name)
-        opts = getattr(vision, self.task_name + "Options")(
-            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model(model_key, model_dir))),
-            running_mode=vision.RunningMode.VIDEO, **options)
-        self.task = task.create_from_options(opts)
+        path = str(ensure_model(model_key, model_dir))
+
+        def build(delegate):
+            base = mpt.BaseOptions(model_asset_path=path, delegate=delegate)
+            opts = getattr(vision, self.task_name + "Options")(base_options=base, running_mode=vision.RunningMode.VIDEO,
+                                                               **options)
+            return task.create_from_options(opts)
+
+        self.on_gpu = False
+        if gpu and not _LandmarkTask.gpu_failed:
+            try:                                 # MediaPipe's GPU delegate: Linux and macOS, not Windows
+                self.task, self.on_gpu = build(mpt.BaseOptions.Delegate.GPU), True
+            except Exception as exc:             # noqa: BLE001 (any failure: use the CPU instead)
+                _LandmarkTask.gpu_failed = True
+                print(f"{self.task_name}: the graphics processor is not available ({type(exc).__name__}); using the CPU")
+        if not self.on_gpu:
+            self.task = build(mpt.BaseOptions.Delegate.CPU)
         self.ts = _Timestamps()
 
     def detect(self, rgb: np.ndarray, t_seconds: float):
@@ -128,8 +142,8 @@ class _LandmarkTask:
 class HandModel(_LandmarkTask):
     task_name = "HandLandmarker"
 
-    def __init__(self, num_hands: int = 2, model_dir: str = "models"):
-        super().__init__("hand", model_dir, num_hands=num_hands)
+    def __init__(self, num_hands: int = 2, model_dir: str = "models", gpu: bool = False):
+        super().__init__("hand", model_dir, gpu, num_hands=num_hands)
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> list[HandResult]:
         h = self.detect(rgb, t_seconds)
@@ -147,8 +161,8 @@ class PoseResult:
 class PoseModel(_LandmarkTask):
     task_name = "PoseLandmarker"
 
-    def __init__(self, variant: str = "pose_full", model_dir: str = "models"):
-        super().__init__(variant, model_dir, num_poses=1)
+    def __init__(self, variant: str = "pose_full", model_dir: str = "models", gpu: bool = False):
+        super().__init__(variant, model_dir, gpu, num_poses=1)
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> PoseResult | None:
         p = self.detect(rgb, t_seconds)
@@ -164,8 +178,8 @@ class FaceModel(_LandmarkTask):
 
     task_name = "FaceLandmarker"
 
-    def __init__(self, model_dir: str = "models"):
-        super().__init__("face", model_dir, num_faces=1, output_face_blendshapes=True)
+    def __init__(self, model_dir: str = "models", gpu: bool = False):
+        super().__init__("face", model_dir, gpu, num_faces=1, output_face_blendshapes=True)
         self.blink = None                       # (right eye, left eye) of the person, from the last frame
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> np.ndarray | None:

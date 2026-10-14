@@ -13,6 +13,9 @@ Latency comes from three places, and each is handled here:
      use only the processor cores the priority models leave free, and on a computer without spare cores
      they still run at a guaranteed minimum rate. On a computer with enough cores everything runs at
      full speed; on a small one the hands stay smooth and the face updates less often.
+  5. One model instance limits the rate to 1 / its inference time. A WorkerGroup runs several instances of
+     the same model, each taking the next frame no other instance has taken, so a model that needs 12 ms per
+     frame gives about 80 results per second with one instance and about 240 with three (on enough cores).
 Each worker records its update rate and its latency (capture to result).
 """
 from __future__ import annotations
@@ -171,12 +174,13 @@ class ModelWorker(threading.Thread):
     """
 
     def __init__(self, name: str, camera: CameraReader, fn, max_hz: float | None = None,
-                 gate: BackgroundGate | None = None, min_hz: float = 5.0):
+                 gate: BackgroundGate | None = None, min_hz: float = 5.0, claim: "FrameClaim | None" = None,
+                 meter: RateMeter | None = None):
         super().__init__(daemon=True, name=name)
         self.camera, self.fn, self.max_hz = camera, fn, max_hz
-        self.gate, self.min_hz = gate, min_hz
+        self.gate, self.min_hz, self.claim = gate, min_hz, claim
         self.latest: Result | None = None
-        self.meter = RateMeter()
+        self.meter = meter or RateMeter()
         self.error: BaseException | None = None
         self.stopped = threading.Event()
         self._lock = threading.Lock()
@@ -184,11 +188,13 @@ class ModelWorker(threading.Thread):
     def run(self):
         last, t_start = 0, -1e9
         while not self.stopped.is_set():
-            frame = self.camera.wait_newer(last, timeout=0.5)
+            frame = self.camera.wait_newer(max(last, self.claim.last if self.claim else 0), timeout=0.5)
             if frame is None:
                 if self.camera.failed:
                     break
                 continue
+            if self.claim is not None and not self.claim.take(frame.index):
+                continue                                   # another instance of this model took it
             got = False
             if self.gate is not None:
                 got = self.gate.acquire(t_start + 1.0 / self.min_hz - time.monotonic(), self.stopped)
@@ -224,6 +230,65 @@ class ModelWorker(threading.Thread):
 
     def stop(self):
         self.stopped.set()
+
+
+class FrameClaim:
+    """Shared by the instances of one model so that each frame goes to exactly one of them."""
+
+    def __init__(self):
+        self.last = 0
+        self._lock = threading.Lock()
+
+    def take(self, index: int) -> bool:
+        with self._lock:
+            if index <= self.last:
+                return False
+            self.last = index
+            return True
+
+
+class WorkerGroup:
+    """Several instances of one model working on alternate frames, seen from outside as one worker.
+
+    fns: one function per instance, each with its own model (a MediaPipe task in VIDEO mode belongs to one
+    thread). Results come back from any instance; new_results() returns the ones not yet
+    seen, oldest first, so every frame's result can be used in order.
+    """
+
+    def __init__(self, name: str, camera: CameraReader, fns: list, **kw):
+        self.name, self.claim, self.meter = name, FrameClaim(), RateMeter()
+        self.fns = list(fns)
+        self.workers = [ModelWorker(f"{name}{i + 1}", camera, fn, claim=self.claim, meter=self.meter, **kw)
+                        for i, fn in enumerate(self.fns)]
+
+    @property
+    def error(self):
+        return next((w.error for w in self.workers if w.error is not None), None)
+
+    @property
+    def ident(self):
+        return self.workers[0].ident
+
+    def start(self):
+        for w in self.workers:
+            w.start()
+
+    def stop(self):
+        for w in self.workers:
+            w.stop()
+
+    def join(self, timeout=None):
+        for w in self.workers:
+            if w.ident is not None:
+                w.join(timeout)
+
+    def get(self) -> Result | None:
+        rs = [r for r in (w.get() for w in self.workers) if r is not None]
+        return max(rs, key=lambda r: r.frame_index) if rs else None
+
+    def new_results(self, after_index: int) -> list:
+        rs = [r for r in (w.get() for w in self.workers) if r is not None and r.frame_index > after_index]
+        return sorted(rs, key=lambda r: r.frame_index)
 
 
 def stop_all(threads, timeout: float = 2.0):
