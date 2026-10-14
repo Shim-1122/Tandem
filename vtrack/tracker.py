@@ -1,7 +1,9 @@
 """MediaPipe Tasks wrappers: hand, pose and face landmarks per video frame.
 
-HandModel, PoseModel and FaceModel each own one MediaPipe task and are meant to be used from one worker
-thread each (see pipeline.py). Tracker runs hands and pose one after the other (simple, single thread).
+HandModel, PoseModel and FaceModel each own one MediaPipe task (VIDEO running mode, which tracks from frame to
+frame instead of detecting from scratch) and are meant to be used from one worker thread each (see
+pipeline.py). They share one base class for the task options, timestamps and image conversion. FaceModel also
+asks MediaPipe for its face blendshapes, of which the eye blink scores are used to skip blinks in eye tracking.
 Imports mediapipe lazily so the math modules and tests run without it installed.
 """
 from __future__ import annotations
@@ -44,52 +46,6 @@ class FrameResult:
 
 def _arr(landmarks) -> np.ndarray:
     return np.array([[p.x, p.y, p.z] for p in landmarks], dtype=float)
-
-
-class Tracker:
-    def __init__(self, num_hands: int = 2, pose: str | None = "pose_lite", model_dir: str = "models"):
-        import mediapipe as mp
-        from mediapipe.tasks import python as mpt
-        from mediapipe.tasks.python import vision
-
-        self._mp = mp
-        run = vision.RunningMode.VIDEO
-        self._hands = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
-            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model("hand", model_dir))),
-            running_mode=run, num_hands=num_hands))
-        self._pose = None
-        if pose:
-            self._pose = vision.PoseLandmarker.create_from_options(vision.PoseLandmarkerOptions(
-                base_options=mpt.BaseOptions(model_asset_path=str(ensure_model(pose, model_dir))),
-                running_mode=run, num_poses=1))
-
-    def process(self, frame_rgb: np.ndarray, timestamp_ms: int) -> FrameResult:
-        """frame_rgb: uint8 HxWx3 RGB. timestamp_ms must increase on every call."""
-        img = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=np.ascontiguousarray(frame_rgb))
-        out = FrameResult()
-        h = self._hands.detect_for_video(img, timestamp_ms)
-        for lm, wl, hd in zip(h.hand_landmarks, h.hand_world_landmarks, h.handedness):
-            out.hands.append(HandResult(hd[0].category_name, _arr(wl), _arr(lm)))
-        if self._pose is not None:
-            p = self._pose.detect_for_video(img, timestamp_ms)
-            if p.pose_world_landmarks:
-                out.pose_world = _arr(p.pose_world_landmarks[0])
-                out.pose_image = _arr(p.pose_landmarks[0])
-                out.pose_visibility = np.array([q.visibility for q in p.pose_landmarks[0]])
-        return out
-
-    def close(self):
-        """Release the MediaPipe tasks; call before exit to avoid shutdown-order warnings."""
-        for t in (self._hands, self._pose):
-            if t is not None:
-                t.close()
-        self._hands = self._pose = None
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        self.close()
 
 
 def pick_hand(res: "FrameResult", side: str, max_dist: float = 0.15) -> "HandResult | None":
@@ -146,22 +102,39 @@ def _image(rgb):
     return mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
 
 
-class HandModel:
-    def __init__(self, num_hands: int = 2, model_dir: str = "models"):
+class _LandmarkTask:
+    """One MediaPipe landmarker task in VIDEO mode: builds it from a model key and options, converts frames,
+    keeps the timestamps increasing, and closes it."""
+
+    task_name = ""                      # HandLandmarker, PoseLandmarker or FaceLandmarker
+
+    def __init__(self, model_key: str, model_dir: str = "models", **options):
         from mediapipe.tasks import python as mpt
         from mediapipe.tasks.python import vision
-        self.task = vision.HandLandmarker.create_from_options(vision.HandLandmarkerOptions(
-            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model("hand", model_dir))),
-            running_mode=vision.RunningMode.VIDEO, num_hands=num_hands))
+        task = getattr(vision, self.task_name)
+        opts = getattr(vision, self.task_name + "Options")(
+            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model(model_key, model_dir))),
+            running_mode=vision.RunningMode.VIDEO, **options)
+        self.task = task.create_from_options(opts)
         self.ts = _Timestamps()
 
-    def process(self, rgb: np.ndarray, t_seconds: float) -> list[HandResult]:
-        h = self.task.detect_for_video(_image(rgb), self.ts(t_seconds))
-        return [HandResult(hd[0].category_name, _arr(wl), _arr(lm))
-                for lm, wl, hd in zip(h.hand_landmarks, h.hand_world_landmarks, h.handedness)]
+    def detect(self, rgb: np.ndarray, t_seconds: float):
+        return self.task.detect_for_video(_image(rgb), self.ts(t_seconds))
 
     def close(self):
         self.task.close()
+
+
+class HandModel(_LandmarkTask):
+    task_name = "HandLandmarker"
+
+    def __init__(self, num_hands: int = 2, model_dir: str = "models"):
+        super().__init__("hand", model_dir, num_hands=num_hands)
+
+    def process(self, rgb: np.ndarray, t_seconds: float) -> list[HandResult]:
+        h = self.detect(rgb, t_seconds)
+        return [HandResult(hd[0].category_name, _arr(wl), _arr(lm))
+                for lm, wl, hd in zip(h.hand_landmarks, h.hand_world_landmarks, h.handedness)]
 
 
 @dataclass
@@ -171,40 +144,42 @@ class PoseResult:
     visibility: np.ndarray   # (33,)
 
 
-class PoseModel:
+class PoseModel(_LandmarkTask):
+    task_name = "PoseLandmarker"
+
     def __init__(self, variant: str = "pose_full", model_dir: str = "models"):
-        from mediapipe.tasks import python as mpt
-        from mediapipe.tasks.python import vision
-        self.task = vision.PoseLandmarker.create_from_options(vision.PoseLandmarkerOptions(
-            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model(variant, model_dir))),
-            running_mode=vision.RunningMode.VIDEO, num_poses=1))
-        self.ts = _Timestamps()
+        super().__init__(variant, model_dir, num_poses=1)
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> PoseResult | None:
-        p = self.task.detect_for_video(_image(rgb), self.ts(t_seconds))
+        p = self.detect(rgb, t_seconds)
         if not p.pose_world_landmarks:
             return None
         return PoseResult(_arr(p.pose_world_landmarks[0]), _arr(p.pose_landmarks[0]),
                           np.array([q.visibility for q in p.pose_landmarks[0]]))
 
 
-class FaceModel:
-    """Face mesh: 478 landmarks (normalized x, y and relative depth z) for the most prominent face."""
+class FaceModel(_LandmarkTask):
+    """Face mesh: 478 landmarks (normalized x, y and relative depth z) for the most prominent face, plus
+    MediaPipe's eye blink scores (0 open .. 1 closed) from its blendshape model."""
+
+    task_name = "FaceLandmarker"
 
     def __init__(self, model_dir: str = "models"):
-        from mediapipe.tasks import python as mpt
-        from mediapipe.tasks.python import vision
-        self.task = vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
-            base_options=mpt.BaseOptions(model_asset_path=str(ensure_model("face", model_dir))),
-            running_mode=vision.RunningMode.VIDEO, num_faces=1))
-        self.ts = _Timestamps()
+        super().__init__("face", model_dir, num_faces=1, output_face_blendshapes=True)
+        self.blink = None                       # (right eye, left eye) of the person, from the last frame
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> np.ndarray | None:
-        r = self.task.detect_for_video(_image(rgb), self.ts(t_seconds))
+        r = self.detect(rgb, t_seconds)
+        self.blink = blink_scores(r.face_blendshapes[0]) if r.face_blendshapes else None
         return _arr(r.face_landmarks[0]) if r.face_landmarks else None
 
-    def close(self):
-        self.task.close()
 
+def blink_scores(blendshapes) -> tuple | None:
+    """(right eye, left eye) blink scores of the person from MediaPipe's face blendshapes.
 
-PoseModel.close = HandModel.close
+    The blendshapes follow ARKit's naming, where eyeBlinkLeft is the person's own left eye.
+    """
+    d = {c.category_name: float(c.score) for c in blendshapes}
+    if "eyeBlinkRight" not in d or "eyeBlinkLeft" not in d:
+        return None
+    return d["eyeBlinkRight"], d["eyeBlinkLeft"]

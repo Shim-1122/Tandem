@@ -33,6 +33,7 @@ from .head import ANCHOR_IDS, HEAD_AXES_IN_MODEL, MODEL_POINTS_M
 EYES = {"right": dict(outer=33, inner=133, iris=468, upper=159, lower=145),     # your right eye
         "left": dict(outer=263, inner=362, iris=473, upper=386, lower=374)}
 EYEBALL_RADIUS_M = 0.012
+BLINK_SCORE = 0.5             # MediaPipe blendshape eyeBlink score above this: the eye is closed
 CLOSED_RATIO = 0.13            # lid gap / eye width below this: the eye is closed
 MIN_SPREAD_M = 0.005           # calibration: the gaze points must spread at least this much (std, each way)
 NEUTRAL_DY_M = 0.0             # iris height above the eye-corner line when looking straight ahead (head frame);
@@ -68,7 +69,10 @@ class EyeState:
     openness: tuple = (float("nan"), float("nan"))   # lid gap / eye width, (right, left)
 
 
-def eye_state(L, pose, width: int, height: int, K: np.ndarray, neutral_dy: float = NEUTRAL_DY_M) -> EyeState:
+def eye_state(L, pose, width: int, height: int, K: np.ndarray, neutral_dy: float = NEUTRAL_DY_M,
+              blink=None) -> EyeState:
+    """blink: optional (right, left) blink scores 0..1 from MediaPipe's face blendshapes; either eye above
+    BLINK_SCORE counts as closed, as does a lid gap under CLOSED_RATIO of the eye's width."""
     if L is None or pose is None or len(L) < 478:
         return EyeState(False)
     L = np.asarray(L, dtype=float)
@@ -83,7 +87,7 @@ def eye_state(L, pose, width: int, height: int, K: np.ndarray, neutral_dy: float
         offsets.append(model[2] - mid_m)
         mids.append((cam[0] + cam[1]) / 2)
     state = EyeState(False, openness=(float(opened[0]), float(opened[1])))
-    if min(opened) < CLOSED_RATIO:
+    if min(opened) < CLOSED_RATIO or (blink is not None and max(blink) > BLINK_SCORE):
         return state
     dx, dy = float(np.mean([o[0] for o in offsets])), float(np.mean([o[1] for o in offsets])) - neutral_dy
     R = EYEBALL_RADIUS_M

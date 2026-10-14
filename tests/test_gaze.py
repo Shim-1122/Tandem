@@ -199,3 +199,16 @@ def test_dwell_locking():
     assert lock.locked and lock.display_point == pytest.approx([502.5, 400], abs=3)
     assert not lock.update([900, 100], t + 1.0) and lock.locked      # stays locked until released
     assert not TargetLock(W, H, K).update([1, 1], 0.0)               # dwell off by default
+
+
+def test_mediapipe_blink_scores_close_the_eyes():
+    from vtrack.tracker import blink_scores
+
+    class C:
+        def __init__(self, name, score):
+            self.category_name, self.score = name, score
+    assert blink_scores([C("eyeBlinkLeft", 0.9), C("eyeBlinkRight", 0.1), C("jawOpen", 0.3)]) == (0.1, 0.9)
+    assert blink_scores([C("jawOpen", 0.3)]) is None
+    L, pose, _ = face()
+    assert eye_state(L, pose, W, H, K, blink=(0.1, 0.2)).valid
+    assert not eye_state(L, pose, W, H, K, blink=(0.1, 0.8)).valid      # one eye shut: a blink or a wink

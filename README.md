@@ -76,7 +76,7 @@ connection the first time.
    | `.venv\Scripts\python -m pip install -r requirements.txt` | `.venv/bin/python -m pip install -r requirements.txt` |
 
 5. **Check it** (no camera needed, about a minute): `.venv\Scripts\python -m pytest` on Windows,
-   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `215 passed`.
+   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `218 passed`.
 6. **Run it:** `.venv\Scripts\python scripts\live.py` on Windows, `.venv/bin/python scripts/live.py` on Mac or
    Linux. The first run downloads about 40 MB of models into `models/` and unpacks the object model (about a
    second). On a Mac, the first run asks for camera access: allow it for Terminal (System Settings > Privacy &
@@ -105,11 +105,14 @@ The window has three parts:
 - **Left: the video** (mirrored in body mode, like a mirror) with the landmark wireframe (cyan body, yellow
   hands), the head's four anchor points and its axes (red forward, green up, blue right), a box and label on
   each tracked object (a held object in its hand's color with its grip force), the gaze cursor and locked
-  target once calibrated, and a compact readout in the top left corner. The readout has one table with every
-  joint angle (both arms and the core on the left, both legs on the right, L and R columns), then lines for
-  what is out of view, where "up" comes from, gestures, each hand's grasp, the objects in view, the eyes, the
-  latest message, a status line with each model's rate and latency, and the keys. Press `f` for the finger
-  joint table underneath.
+  target once calibrated, and a compact readout in the top left corner. The readout shows the kinematics of
+  every part of the body at once, in three tables side by side: both arms (L and R columns: shoulder 3, elbow,
+  forearm, wrist 2), both legs (L and R: hip 4, knee, ankle 3, foot 2), and the body's middle (core flexion,
+  side bend and rotation; the neck, which is the head relative to the torso; the head relative to the camera;
+  and the eyes relative to the head). Under the tables are lines for what is out of view, where "up" comes from,
+  gestures, each hand's grasp, the objects in view, the eye calibration and target, the latest message, a status
+  line with each model's rate and latency, and the keys; below those, both hands' finger joint tables side by
+  side (`f` cycles both, left, right, off).
 - **Top right: the face panel.** Your face, who it is (after you enroll), the six cardinal emotions with
   percentages, and the head's 6 DOF (position and yaw, pitch, roll, plus motion since you zeroed it with `h`).
 - **Bottom right: the 3D panel.** In body mode it rebuilds your whole body from the solved joint angles through
@@ -140,7 +143,7 @@ Click the video window first so it receives the keys.
 | `k` | calibrate the emotion tracker to your face (about 30 seconds of prompts; `k` again cancels) |
 | `g` | calibrate eye tracking: look at 9 dots in turn (about 20 seconds; `g` again cancels) |
 | `t` | lock onto the spot you are looking at, or release it (a pinch with either hand does the same) |
-| `f` | cycle the finger joint table (off, then each tracked hand) |
+| `f` | cycle the finger joint tables: both hands (the default), left, right, off |
 | `c` | print checks (axes, arm lengths, hand agreement) to the terminal |
 | `w` | toggle the wireframe |
 | `o` | show or hide the object boxes |
@@ -241,7 +244,7 @@ hidden: that motion does not change the shoulder or wrist, so only MediaPipe's g
 
 ## Fingers
 
-Press `f` to show the finger joint table (in POV mode it starts on). Angles are measured in the palm's own
+Both hands' finger joint tables are shown from the start (`f` cycles both, left, right and off). Angles are measured in the palm's own
 frame, so they do not change when the whole hand moves, and a left hand is mirrored so the signs match.
 
 | Digit | Angles (deg) |
@@ -318,8 +321,8 @@ The face mesh model also finds the center of each iris. With the head pose, that
 1. The eye corners and the iris centers are placed in 3D (the same depth model as the head pose) and turned
    into the head's own frame, which removes head rotation and perspective.
 2. How far each iris sits from the middle of its eye corners gives the eye's rotation in the head, assuming
-   a 12 mm eyeball radius, averaged over both eyes. A blink (lid gap under 13% of the eye width) is skipped
-   and the last gaze point is kept.
+   a 12 mm eyeball radius, averaged over both eyes. A blink is skipped and the last gaze point is kept: either
+   eye's blink score from MediaPipe's face blendshapes above 0.5, or a lid gap under 13% of the eye width.
 3. The gaze ray, from between the eyes, is followed until it meets the plane of the camera, which is the
    screen the webcam sits on.
 
@@ -774,7 +777,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | Folder or file | Contents |
 | --- | --- |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
-| `tests/` | 215 automated tests (see [Tests](#tests)) |
+| `tests/` | 218 automated tests (see [Tests](#tests)) |
 | `models/` | downloaded and unpacked models (created on first run; not in git) |
 | `faces/` | enrolled faces and emotion calibrations (created when you enroll; not in git) |
 | `requirements.txt` | numpy, mediapipe, opencv-python, onnxruntime, certifi, pytest |
@@ -800,11 +803,11 @@ publishing the repository or shipping it in a product would bring in the AGPL's 
 ## Tests
 
 ```
-python -m pytest            # all 215 tests, about a minute, no camera needed
+python -m pytest            # all 218 tests, about a minute, no camera needed
 python -m pytest -k grasp   # just one area
 ```
 
-All 215 pass on Python 3.9 and 3.13. Covered: kinematics round trips for both arms and both legs and the core
+All 218 pass on Python 3.9 and 3.13. Covered: kinematics round trips for both arms and both legs and the core
 (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted camera, PnP hand
 position recovery, all gestures in random orientations for both hands, head pose round trips, eye angles and gaze
 points (exact for random head poses), gaze calibration that survives head motion, target locking, emotion

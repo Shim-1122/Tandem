@@ -156,3 +156,12 @@ def test_two_arm_panel_and_column_text_render():
     canvas = np.zeros((200, 600, 3), np.uint8)
     text_block(canvas, ["\tLEFT\tRIGHT", "Elbow flexion\t110.0\t80.0", "torso up: calibrated"])
     assert canvas.any()
+
+
+def test_wireframes_match_mediapipe_topology():
+    vision = pytest.importorskip("mediapipe.tasks.python.vision")
+    from vtrack.draw import HAND_EDGES, POSE_ARM_EDGES, POSE_LEG_EDGES
+    edges = lambda cs: {tuple(sorted((c.start, c.end))) for c in cs}            # noqa: E731
+    assert {tuple(sorted(e)) for e in HAND_EDGES} == edges(vision.HandLandmarksConnections.HAND_CONNECTIONS)
+    body = edges(vision.PoseLandmarksConnections.POSE_LANDMARKS)
+    assert {tuple(sorted(e)) for e in POSE_ARM_EDGES + POSE_LEG_EDGES} <= body   # the face is drawn separately

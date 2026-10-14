@@ -45,6 +45,7 @@ LEG_LABELS = {"hip_flexion": "Hip flex/ext", "hip_abduction": "Hip abd/add", "hi
               "foot_roll": "Foot roll"}
 CORE_LABELS = {"core_flexion": "Core flex/ext", "core_lateral_bend": "Core side bend", "core_rotation": "Core rotation"}
 FINGER_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+TABLE_ALIGN = "lrrlrrlr"                # arms (L, R), legs (L, R), core / neck / head / eyes
 GRASP_COLS = ["grasp_state", "grasp_object", "hand_shape", "grip_type", "grip_n", "grip_cmd", "grip_open_cm"]
 FINGER_COLS = [f"{f}_{k}" for f in ["index", "middle", "ring", "pinky"] for k in FINGER_KEYS] + \
               [f"thumb_{k}" for k in THUMB_KEYS]
@@ -138,7 +139,7 @@ def default_models(cfg: Config, size):
 
                 def run(frame):
                     L = fm.process(frame.rgb, frame.t)
-                    return None if L is None else (L, est.solve(L, w, h, K))
+                    return None if L is None else (L, est.solve(L, w, h, K), fm.blink)
                 run.close = fm.close
                 return run
             makers["face"] = face
@@ -258,8 +259,8 @@ class App:
         self.pov_zero, self.pov_info = HandPoseZero(), None
         # ui state
         self.show_wire = True
-        self.table_cycle = [None] + hand_sides
-        self.table_i = 1 if self.pov else 0
+        self.table_cycle = (["both"] if len(hand_sides) > 1 else []) + hand_sides + [None]
+        self.table_i = 0                            # every tracked hand's finger joints are shown from the start
         self.want_check = self.want_calib = False
         self.message, self.message_t = "", 0.0
         self.writer, self._csv_file = None, None
@@ -522,18 +523,19 @@ class App:
             self.head_ang.reset()
             self.head_pos.reset()
             return
-        L, hp = r.value
+        L, hp = r.value[:2]
+        blink = r.value[2] if len(r.value) > 2 else None
         self.face_L, self.head_raw = L, hp
         a = self.head_ang({"yaw": hp.yaw, "pitch": hp.pitch, "roll": hp.roll}, r.t_capture)
         pos = self.head_pos(hp.position_cm, r.t_capture) / 100.0
         axes = head_axes_from_angles(a["yaw"], a["pitch"], a["roll"])
         self.head = dataclasses.replace(hp, axes=axes, position_m=np.asarray(pos, float), yaw=a["yaw"],
                                         pitch=a["pitch"], roll=a["roll"])
-        self._update_gaze(L, hp, r.t_capture)
+        self._update_gaze(L, hp, r.t_capture, blink)
 
-    def _update_gaze(self, L, pose, t):
+    def _update_gaze(self, L, pose, t, blink=None):
         """Eye angles, the calibrated gaze point on the video (as displayed), dwell locking."""
-        self.eye = eye_state(L, pose, self.size[0], self.size[1], self.K)
+        self.eye = eye_state(L, pose, self.size[0], self.size[1], self.K, blink=blink)
         e = self.eye
         if not e.valid or e.plane_point is None:
             return                                   # blink or looking away: keep the last gaze point
@@ -656,7 +658,9 @@ class App:
         return lines
 
     def body_table(self):
-        """Rows of "arm/core label, L, R, leg label, L, R" (tab separated; draw with align "lrrlrr").
+        """Every body part's angles, as three tables side by side (tab separated; draw with align TABLE_ALIGN):
+        arms (L, R), legs (L, R), and the body's middle: core, neck (head relative to the torso), head (relative to
+        the camera) and eyes (relative to the head).
 
         Flags after a value: ! outside the normal range, h held (shoulder rotation with a straight elbow, or hip
         rotation without the foot in view), f hip rotation from the foot (knee straight; ankle abd/add is then 0).
@@ -679,8 +683,6 @@ class App:
                                                      and not a.shoulder_rotation_valid else "")
                 cells.append(cell(v, flag))
             left_rows.append([LABELS[k], *cells])
-        for k in CORE_FIELDS:
-            left_rows.append([CORE_LABELS[k], cell(getattr(self.core, k)), ""])
         right_rows = []
         for k in LEG_FIELDS:
             cells = []
@@ -692,10 +694,20 @@ class App:
                     flag += {"foot": "f", "held": "h"}.get(a.hip_rotation_source, "")
                 cells.append(cell(v, flag))
             right_rows.append([LEG_LABELS[k], *cells])
-        n = max(len(left_rows), len(right_rows))
+        axial = [[CORE_LABELS[k], cell(getattr(self.core, k))] for k in CORE_FIELDS]
+        neck = self.neck_axes()
+        nyaw, npitch, nroll = angles_from_axes(neck, np.eye(3)) if neck is not None else (np.nan,) * 3
+        h, e = self.head, self.eye
+        eye_ok = e is not None and e.valid
+        axial += [["Neck yaw", cell(nyaw)], ["Neck pitch", cell(npitch)], ["Neck roll", cell(nroll)],
+                  ["Head yaw", cell(h.yaw if h else np.nan)], ["Head pitch", cell(h.pitch if h else np.nan)],
+                  ["Head roll", cell(h.roll if h else np.nan)],
+                  ["Eye yaw", cell(e.yaw if eye_ok else np.nan)], ["Eye pitch", cell(e.pitch if eye_ok else np.nan)]]
+        n = max(len(left_rows), len(right_rows), len(axial))
         left_rows += [["", "", ""]] * (n - len(left_rows))
         right_rows += [["", "", ""]] * (n - len(right_rows))
-        return ["\tL\tR\t\tL\tR"] + ["\t".join(a + b) for a, b in zip(left_rows, right_rows)]
+        axial += [["", ""]] * (n - len(axial))
+        return ["\tL\tR\t\tL\tR\t\t"] + ["\t".join(a + b + c) for a, b, c in zip(left_rows, right_rows, axial)]
 
     def grasp_lines(self):
         """One line per hand (what it holds and the grip for it) and the objects in view."""
@@ -714,17 +726,21 @@ class App:
             return "eyes: no face"
         if not e.valid:
             return "eyes: closed or not found"
-        eyes = f"eyes yaw {num(e.yaw, 0)} pitch {num(e.pitch, 0)} (approx.)"
+        eyes = "eyes: open (angles in the table)"
         if self.gaze_map is None:
             return eyes + "   gaze: press g to calibrate"
         target = f"target LOCKED {self._target_text()}" if self.target.locked else "target: t or pinch to lock"
         return f"{eyes}   gaze {self.gaze_map.error_deg:.1f} deg   {target}"
 
     def finger_lines(self):
+        """Finger joint table(s): both hands side by side, one hand, or none (key f cycles)."""
         tsd = self.table_cycle[self.table_i]
         if tsd is None:
             return []
-        return finger_table(self.fingers[tsd], f"{tsd} fingers") if tsd in self.fingers else [f"{tsd} hand not detected"]
+        sides = ["left", "right"] if tsd == "both" else [tsd]
+        tables = [finger_table(self.fingers[sd], f"{sd} fingers") if sd in self.fingers else
+                  [f"{sd} fingers\t--\t--\t--\t--"] + [f"{f}\t--\t--\t--\t--" for f in FINGER_ORDER] for sd in sides]
+        return ["\t".join(row) for row in zip(*tables)]
 
     def face_panel(self, frame, size):
         if self.pov:
@@ -786,8 +802,8 @@ class App:
         else:
             if self.show_objects:
                 self._draw_objects(video)
-            _, h1 = text_block(video, self.text_lines(now), align=None if self.pov else "lrrlrr")
-            text_block(video, self.finger_lines(), origin=(0, h1 + 4))
+            _, h1 = text_block(video, self.text_lines(now), align=None if self.pov else TABLE_ALIGN)
+            text_block(video, self.finger_lines(), origin=(0, h1 + 4), align="lrrrr" * 2)
             self._draw_gaze(video, now)
         if self.cal_session is not None:
             self._banner(video, self.cal_session.prompt(now))

@@ -146,12 +146,17 @@ def test_body_mode_end_to_end(tmp_path):
         assert app.legs[sd].pelvic_hike == pytest.approx(0, abs=0.5)
     assert app.legs["left"].hip_rotation_source == "foot" and app.legs["right"].hip_rotation_source == "knee"
     assert (app.core.core_flexion, app.core.core_lateral_bend, app.core.core_rotation) == pytest.approx((0, 0, 0), abs=0.5)
-    # one readout table: arms and core on the left, legs on the right (single arm mode: left arm column empty)
+    # one readout with every body part: arms, legs, then core, neck, head and eyes (single arm: left column empty)
     rows = [r.split("\t") for r in app.body_table()]
-    assert all(len(r) == 6 for r in rows) and rows[0] == ["", "L", "R", "", "L", "R"]
+    assert all(len(r) == 8 for r in rows) and rows[0] == ["", "L", "R", "", "L", "R", "", ""]
     table = {r[0]: r[1:3] for r in rows[1:] if r[0]} | {r[3]: r[4:6] for r in rows[1:] if r[3]}
+    middle = {r[6]: r[7] for r in rows[1:] if r[6]}
     assert table["Knee flexion"] == ["6.0", "50.0"] and table["Hip rotation"][0] == "-12.0f"
-    assert table["Core rotation"] == ["0.0", ""] and table["Elbow flexion"] == ["", "75.0"]
+    assert middle["Core rotation"] == "0.0" and table["Elbow flexion"] == ["", "75.0"]
+    assert set(middle) == {"Core flex/ext", "Core side bend", "Core rotation", "Neck yaw", "Neck pitch", "Neck roll",
+                           "Head yaw", "Head pitch", "Head roll", "Eye yaw", "Eye pitch"}
+    assert float(middle["Head yaw"]) == pytest.approx(HEAD[0], abs=1.0)
+    assert middle["Neck yaw"] != "--" and middle["Head pitch"] != "--"
     assert table["Shoulder flex/ext"][1] == "35.0"
 
     rows = list(csv.reader(open(rec, encoding="utf-8")))
@@ -403,3 +408,26 @@ def test_grasp_tracking_in_pov_mode(tmp_path):
         app.close()
     rows = list(csv.reader(open(tmp_path / "pov.csv", encoding="utf-8")))
     assert dict(zip(rows[0], rows[-1]))["grasp_object"] == "tennis ball"
+
+
+def test_finger_tables_for_both_hands_shown_from_the_start():
+    app = App(Config(cores=8), FakeCap(), fake_models())
+    try:
+        last, t0 = 0, time.monotonic()
+        while time.monotonic() - t0 < 0.6:
+            f = app.camera.wait_newer(last, 2.0)
+            last = f.index
+            app.step(f)
+        rows = [r.split("\t") for r in app.finger_lines()]
+        assert rows[0][0] == "left fingers" and rows[0][5] == "right fingers" and len(rows) == 6
+        assert all(len(r) == 10 for r in rows) and rows[1][1] == "--" and rows[1][6] != "--"   # only the right hand
+        app.handle_key(ord("f"))
+        assert app.finger_lines()[0].startswith("left fingers") and len(app.finger_lines()[0].split("\t")) == 5
+        app.handle_key(ord("f"))
+        assert app.finger_lines()[0].startswith("right fingers")
+        app.handle_key(ord("f"))
+        assert app.finger_lines() == []                       # off
+        app.handle_key(ord("f"))
+        assert app.finger_lines()[0].startswith("left fingers\t") and "right fingers" in app.finger_lines()[0]
+    finally:
+        app.close()
