@@ -1,0 +1,7 @@
+# Jarvis's voice (optional): wake word, speech to text, text to speech, all on your own computer.
+# Typed commands, reflexes and the Ollama brain need nothing beyond requirements.txt.
+openwakeword>=0.6
+faster-whisper>=1.0
+piper-tts>=1.2
+sounddevice>=0.4
+# pyserial>=3.5      # only for jarvis.robot.SerialRobot (a microcontroller driving the real arm)
