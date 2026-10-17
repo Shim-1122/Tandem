@@ -29,8 +29,11 @@ ACTIONS = {
     "shrug": ("Shrug, for 'I don't know'.", {}, []),
     "rest": ("Go back to the relaxed rest pose and stop looking at anything.", {}, []),
     "freeze": ("Stop all motion immediately and hold still.", {}, []),
-    "shadow": ("Start or stop copying the person's movements (shadow mode).",
-               {"on": {"type": "boolean"}}, ["on"]),
+    "shadow": ("Start or stop shadow mode. mirror=true (default) moves like their reflection; mirror=false copies "
+               "joint for joint (its right arm follows their right arm).",
+               {"on": {"type": "boolean"}, "mirror": {"type": "boolean"}}, ["on"]),
+    "play_rock_paper_scissors": ("Start a game of rock paper scissors with the person. The game runs itself: it "
+                                 "counts, throws, reads their hand and keeps score.", {}, []),
 }
 
 
@@ -49,6 +52,10 @@ def resolve(where: str, perception) -> tuple | None:
     if where == "target":
         return perception.target_direction() if perception else None
     return DIRECTIONS.get(where)
+
+
+def _flag(v) -> bool:
+    return v if isinstance(v, bool) else str(v).lower() in ("1", "true", "yes", "on")
 
 
 def apply(body: skills.Body, name: str, args: dict, now: float, perception=None, queue: bool = False) -> str:
@@ -86,8 +93,7 @@ def apply(body: skills.Body, name: str, args: dict, now: float, perception=None,
         body.freeze()
         return "freeze"
     if name == "shadow":
-        on = args.get("on", True)
-        on = on if isinstance(on, bool) else str(on).lower() in ("1", "true", "yes", "on")
-        body.set_shadow(on)
-        return "shadow on" if on else "shadow off"
+        on, mirror = _flag(args.get("on", True)), args.get("mirror")
+        body.set_shadow(on, None if mirror is None else _flag(mirror))
+        return ("shadow on, " + ("mirror" if body.mirror else "copy")) if on else "shadow off"
     raise ValueError(f"unknown action '{name}'")

@@ -66,8 +66,11 @@ class RuleBrain(Brain):
             return "Stopping.", [("freeze", {})]
         rules = [
             (NOT_STOP.pattern + r"|\bshadow mode off\b", "Shadow mode off.", [("shadow", {"on": False})]),
-            (r"\b(shadow|copy|mirror|follow) me\b|\bshadow mode\b|\bstart shadow", "On it. Copying you.",
-             [("shadow", {"on": True})]),
+            (r"\bcopy me\b|\bcopy (my|what i)", "Copying you, joint for joint.",
+             [("shadow", {"on": True, "mirror": False})]),
+            (r"\b(shadow|mirror|follow) me\b|\bshadow mode\b|\bstart shadow|\bmirror my", "Mirroring you.",
+             [("shadow", {"on": True, "mirror": True})]),
+            (r"\brock,? paper,? scissors?\b|\brps\b|\bplay a game\b", "", [("play_rock_paper_scissors", {})]),
             (r"\b(wave|say (hi|hello|bye|goodbye))\b", "", [("wave", _side(t))]),
             (r"\bthumbs? up\b", "", [("thumbs_up", _side(t))]),
             (r"\bnod\b|\bsay yes\b", "", [("nod", {})]),
@@ -115,6 +118,8 @@ Rules:
 - When asked to move, call the matching tools. You may call several in order.
 - Reply in one or two short spoken sentences. Plain words only, no lists, no markdown, no emoji.
 - Directions are your own: your left is the person's right when you face them.
+- "Shadow me" or "mirror me" means shadow with mirror true; "copy me" means mirror false.
+- For rock paper scissors, call play_rock_paper_scissors and just say you're in; the game does the rest.
 - If unsure what they want, ask a short question instead of moving.
 - Safety first: if anything sounds unsafe, or they say stop, call freeze.
 

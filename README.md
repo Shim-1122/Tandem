@@ -79,7 +79,7 @@ connection the first time.
    | `.venv\Scripts\python -m pip install -r requirements.txt` | `.venv/bin/python -m pip install -r requirements.txt` |
 
 5. **Check it** (no camera needed, about a minute): `.venv\Scripts\python -m pytest` on Windows,
-   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `262 passed`.
+   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `278 passed`.
 6. **Run it:** `.venv\Scripts\python scripts\live.py` on Windows, `.venv/bin/python scripts/live.py` on Mac or
    Linux. The first run downloads about 40 MB of models into `models/` and unpacks the object model (about a
    second). On a Mac, the first run asks for camera access: allow it for Terminal (System Settings > Privacy &
@@ -835,7 +835,8 @@ drives the robot. Everything runs on your computer; nothing goes to the cloud.
 python scripts/jarvis.py                        # camera + simulated robot; type commands in the terminal
 python scripts/jarvis.py --voice                # also "Hey Jarvis" by voice, replies spoken aloud
 python scripts/jarvis.py --demo                 # a scripted visitor instead of the camera (no webcam needed)
-python scripts/jarvis.py --demo --video j.mp4   # save that demo as a video
+python scripts/jarvis.py --demo games           # scripted voice commands: rock paper scissors, then shadow me
+python scripts/jarvis.py --demo games --video g.mp4   # save a demo as a video
 python scripts/jarvis.py --brain rules          # no language model, keyword commands only
 python scripts/jarvis.py --no-camera            # just the robot and your commands
 ```
@@ -846,6 +847,7 @@ python scripts/jarvis.py --no-camera            # just the robot and your comman
 | --- | --- | --- |
 | Perception | `jarvis/perception.py` | Tracker values to events, each held long enough that one noisy frame never counts: a person arrives (0.5 s) or leaves (2 s), a gesture (0.3 s), an emotion over 50% (1 s), a grasp or release, a locked gaze target |
 | Reflexes | `jarvis/reflexes.py` | Events to immediate actions with no language model: greets you by name and looks at you, waves back at an open palm, returns a thumbs up, shakes its head at a thumbs down, celebrates at "I love you", asks if you are OK when you look sad, holds still if you look scared. Each has a cooldown. Edit `RULES` to change its personality |
+| Games | `jarvis/games.py` | Rock paper scissors: the count, the robot's throw, reading yours, the score |
 | Brain | `jarvis/brain.py` | Words to a spoken reply and actions. `OllamaBrain` runs a local language model with tool calling; `RuleBrain` understands short commands and a few questions ("what am I holding?") with no model, and takes over whenever Ollama is not running |
 | Body | `jarvis/skills.py` | Skills to joint targets for all of the robot's joints: rest or shadow mode, then held grips, then where the head looks, then the current skill, then a per-joint speed limit (shoulders 90 deg/s, fingers 300) so every start and stop is smooth |
 | Robot | `jarvis/robot.py` | The targets to the MuJoCo robot (`SimRobot`), or as 0..1 commands over USB serial to a microcontroller (`SerialRobot`, for the real arm; not tested on hardware yet) |
@@ -853,8 +855,26 @@ python scripts/jarvis.py --no-camera            # just the robot and your comman
 
 **Actions** (what the model's tools, the rules and the reflexes can do): wave, nod, shake head, thumbs up, point
 and look (at you, your gaze target, or a direction), reach out a hand, grip (0 to 1) and release, celebrate, shrug,
-rest, freeze, and shadow mode (copy you, like `live.py --sim`). Directions are the robot's own: its left is your
-right when you face it.
+rest, freeze, shadow mode, and rock paper scissors. Directions are the robot's own: its left is your right when
+you face it.
+
+**Shadow mode.** "Hey Jarvis, shadow me" (or "mirror me") makes the robot move like your reflection: facing you,
+it raises its left arm when you raise your right, and turns its head the way you see yours turn. "Copy me" copies
+joint for joint instead (its right arm follows your right arm, as `live.py --sim` does). "Stop mirroring me" (or
+"stop copying me") ends it; plain "stop" freezes everything as always.
+
+**Rock paper scissors** (`jarvis/games.py`). "Hey Jarvis, rock paper scissors?" and the robot gets ready, forearm
+forward with a fist. Show a fist (or say "ready") and it counts "rock, paper, scissors, shoot!" with a fist pump on
+each beat, then throws. Your throw is read from Tandem's gestures: fist is rock, open palm is paper, peace (V) is
+scissors. Because hands pump as fists during the count, your hand is read 0.6 seconds after "shoot", once it has
+changed shape. It says who won, keeps score, celebrates or shrugs, and asks "Again?": say "again" for another
+round, or "no" to end with the match result. Without a camera, say your throw ("scissors!") right after "shoot".
+The robot picks its throw before the count, from a random generator that never sees yours. While a game is on,
+reflexes are paused, so your open palm is paper rather than a wave.
+
+**Talking to it.** Say "Hey Jarvis" and the command in one breath. The microphone keeps the last 1.2 seconds of
+audio from before the wake word fires, so the start of the command is not cut off, and "hey Jarvis" is removed
+from what it heard. Replies are spoken on their own thread, so the robot keeps moving while Jarvis talks.
 
 **Safety.** "Stop", "freeze", "halt" or "hold still", typed, spoken, or the space bar in a window, freezes every
 joint at once. It never waits for the language model. Reflexes do nothing while it is frozen, copying you, or in
@@ -873,9 +893,9 @@ the middle of something you asked for.
 3. `python scripts/jarvis.py --voice`, then say "Hey Jarvis" and a command. The call-me gesture (thumb and pinky
    out) also starts listening. The first run downloads the wake word and Whisper models.
 
-**Try saying:** "wave with your left hand", "point at me", "look at that" (after locking a gaze target), "give me
-a thumbs up and nod", "grip gently with your right hand", "copy me", "stop copying me", "what am I holding?",
-"relax".
+**Try saying:** "Hey Jarvis, shadow me", "stop mirroring me", "rock paper scissors?", "wave with your left hand",
+"point at me", "look at that" (after locking a gaze target), "give me a thumbs up and nod", "grip gently with your
+right hand", "copy me", "what am I holding?", "relax".
 
 ## Verify on your camera first
 
@@ -941,7 +961,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | Folder or file | Contents |
 | --- | --- |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
-| `tests/` | 262 automated tests (see [Tests](#tests)) |
+| `tests/` | 278 automated tests (see [Tests](#tests)) |
 | `docs/` | the picture of the simulated robot |
 | `models/` | downloaded and unpacked models (created on first run; not in git) |
 | `faces/` | enrolled faces and emotion calibrations (created when you enroll; not in git) |
@@ -968,11 +988,11 @@ publishing the repository or shipping it in a product would bring in the AGPL's 
 ## Tests
 
 ```
-python -m pytest            # all 262 tests, about a minute, no camera needed
+python -m pytest            # all 278 tests, about a minute, no camera needed
 python -m pytest -k grasp   # just one area
 ```
 
-All 262 pass on Python 3.13 (on 3.9 without MuJoCo installed, the 9 robot tests are skipped). Covered: kinematics round trips for both arms and both legs and the core
+All 278 pass on Python 3.13 (on 3.9 without MuJoCo installed, the 11 robot tests are skipped). Covered: kinematics round trips for both arms and both legs and the core
 (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted camera, PnP hand
 position recovery, all gestures in random orientations for both hands, head pose round trips, eye angles and gaze
 points (exact for random head poses), gaze calibration that survives head motion, target locking, emotion

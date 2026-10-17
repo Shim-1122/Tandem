@@ -125,9 +125,9 @@ def test_freeze_holds_the_pose_exactly():
     assert b.targets(3.0) == held and b.state() == "frozen"
 
 
-def test_shadow_mode_copies_the_tracker():
+def test_copy_mode_copies_the_tracker_joint_for_joint():
     b = Body(blink=False)
-    b.set_shadow(True)
+    b.set_shadow(True, mirror=False)
     tracker = {"R_elbow_flexion": 100.0, "neck_yaw": 20.0, "L_index_pip": NAN}
     for k in range(120):
         out = b.targets(k / 30, tracker)
@@ -168,7 +168,11 @@ def test_greeting_uses_the_name():
     ("look at me", "look", {"at": "me"}),
     ("grip gently with your right hand", "grip", {"side": "right", "strength": 0.5}),
     ("let go", "release", {}),
-    ("copy me", "shadow", {"on": True}),
+    ("copy me", "shadow", {"on": True, "mirror": False}),
+    ("shadow me", "shadow", {"on": True, "mirror": True}),
+    ("mirror my movements", "shadow", {"on": True, "mirror": True}),
+    ("rock paper scissors?", "play_rock_paper_scissors", {}),
+    ("stop mirroring me", "shadow", {"on": False}),
     ("stop copying me", "shadow", {"on": False}),
     ("FREEZE", "freeze", {}),
     ("relax", "rest", {}),
@@ -292,4 +296,141 @@ def test_jarvis_drives_the_mujoco_robot():
     for k in range(60):
         j.tick(k / 30, {})
     assert robot.sim.angle("R_shoulder_abduction") > 40               # the simulated arm really went up
+    robot.close()
+
+
+# ------------------------------------------------------------------ mirror, wake word, rock paper scissors
+def test_mirror_mode_moves_the_opposite_arm_and_turns_the_other_way():
+    b = Body(blink=False)
+    b.set_shadow(True)                                                  # mirror is the default
+    tracker = {"R_shoulder_abduction": 80.0, "L_shoulder_abduction": 5.0, "neck_yaw": 20.0, "neck_pitch": 10.0}
+    for k in range(120):
+        out = b.targets(k / 30, tracker)
+    assert out["L_shoulder_abduction"] == pytest.approx(80.0)            # your right arm, its left arm
+    assert out["R_shoulder_abduction"] == pytest.approx(5.0)
+    assert out["neck_yaw"] == pytest.approx(-20.0) and out["neck_pitch"] == pytest.approx(10.0)
+    assert b.state() == "mirroring you"
+
+
+@pytest.mark.parametrize("heard,command", [
+    ("Hey Jarvis, shadow me.", "shadow me."), ("hey jarvis rock paper scissors?", "rock paper scissors?"),
+    ("Jarvis, wave", "wave"), ("Okay Jarvis... nod", "nod"), ("wave at jarvis", "wave at jarvis"),
+])
+def test_wake_phrase_is_removed(heard, command):
+    from jarvis.voice import strip_wake
+    assert strip_wake(heard) == command
+
+
+def test_hey_jarvis_shadow_me_starts_mirroring():
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    j.hear("Hey Jarvis, shadow me", wait=True)
+    assert j.body.shadow and j.body.mirror
+    j.hear("Hey Jarvis, stop mirroring me", wait=True)
+    assert not j.body.shadow and not j.body.frozen
+
+
+def _play(j, person_throw, t0, by="gesture", dt=1 / 30, limit=6.0):
+    """Run one round from `t0` with a person who pumps a fist, then throws 0.25 s after "shoot"."""
+    t, shoot = t0, None
+    while t < t0 + limit:
+        g, game = "unknown", j.game
+        if game is None or game.state == "again" and shoot is not None:
+            return t
+        if game.state in ("ready", "count"):
+            g = "fist"
+        elif game.state == "read":
+            shoot = t if shoot is None else shoot
+            if by == "words" and t - shoot >= 0.2 and not getattr(j, "_said", False):
+                j._said = True
+                j.hear(person_throw, wait=True)
+            g = "fist" if t - shoot < 0.25 or by == "words" else {"rock": "fist", "paper": "open_palm",
+                                                                "scissors": "peace"}[person_throw]
+        j.tick(t, face(R_gesture=g, L_gesture="unknown"))
+        t += dt
+    raise AssertionError("round did not finish")
+
+
+def test_rock_paper_scissors_round_by_voice_and_gesture():
+    import random
+    from jarvis.games import winner
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    j.rng = random.Random(3)
+    j.hear("Hey Jarvis, rock paper scissors?", wait=True)
+    assert j.game is not None and j.game.state == "ready" and j.body.motion.name == "rps ready"
+    t = _play(j, "paper", 0.0)
+    g = j.game
+    robot, person, w = g.result
+    assert person == "paper"                       # read as paper, not the fist pumped during the count
+    assert w == winner(robot, "paper") and sum(g.score.values()) == 1
+    said = [txt for who, txt in j.transcript if who == "jarvis"]
+    assert said[1:5] == ["Rock...", "Paper...", "Scissors...", "Shoot!"] and said[-1].endswith("Again?")
+    assert j.body.motion is not None and j.body.motion.name == f"rps {robot}"   # its throw is showing
+    j.clock = lambda: t
+    j.hear("again", wait=True)
+    assert j.game.state == "count"
+    _play(j, "scissors", t)
+    assert j.game.result[1] == "scissors" and sum(j.game.score.values()) == 2
+    j.hear("no, that's enough", wait=True)
+    j.tick(t + 10, face())
+    assert j.game is None and "Good game" in j.transcript[-1][1]
+
+
+def test_rock_paper_scissors_without_a_camera_by_saying_the_throw():
+    import random
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    j.rng = random.Random(1)
+    j.hear("rock paper scissors", wait=True)
+    j.hear("ready", wait=True)
+    assert j.game.state == "count"
+    _play(j, "scissors", 0.0, by="words")
+    assert j.game.result[1] == "scissors"
+
+
+def test_mid_game_gestures_do_not_trigger_reflexes_and_stop_ends_the_game():
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    for k in range(30):
+        j.tick(k / 30, face())                                           # arrives: greeting reflex
+    j.hear("rock paper scissors", wait=True)
+    for k in range(30, 90):
+        j.tick(k / 30, face(R_gesture="open_palm"))                       # would be a wave back outside a game
+    assert j.game is not None and "wave" not in j.body.state()
+    j.hear("stop")
+    assert j.game is None and j.body.frozen
+
+
+def test_robot_throws_are_fair_and_varied():
+    import random
+    from jarvis.games import RockPaperScissors
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    g = RockPaperScissors(j, 0.0, rng=random.Random(0))
+    seen = []
+    for _ in range(300):
+        g._start_count(0.0)
+        seen.append(g.robot_throw)
+    assert {s: seen.count(s) for s in set(seen)}.keys() == {"rock", "paper", "scissors"}
+    assert min(seen.count(s) for s in ("rock", "paper", "scissors")) > 70
+
+
+def test_game_night_demo_runs_on_the_mujoco_robot():
+    pytest.importorskip("mujoco")
+    import random
+    from jarvis.robot import SimRobot
+    robot = SimRobot(scene=False)
+    clock = [0.0]
+    j = Jarvis(robot=robot, log=lambda *a: None, clock=lambda: clock[0])
+    j.rng = random.Random(7)
+    script = demo.GameNight()
+    left_abd = []
+    for k in range(int(script.LENGTH * 30)):
+        t = clock[0] = k / 30
+        values, words = script.step(t, j)
+        if words:
+            j.hear(words, wait=True)
+        j.tick(t, values)
+        if script.phase == "shadow" and t - script.shadow_t > 1.5 and j.body.shadow:
+            left_abd.append(robot.sim.angle("L_shoulder_abduction"))
+    said = " ".join(txt for who, txt in j.transcript if who == "jarvis")
+    assert said.count("Shoot!") == 3 and "Good game" in said and "Mirroring you." in said
+    assert max(left_abd) - min(left_abd) > 30                          # its left arm followed your right
+    assert not j.body.shadow                                           # "stop mirroring me" ended it
     robot.close()

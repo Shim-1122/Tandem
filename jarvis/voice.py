@@ -8,6 +8,8 @@ Both call `on_text(text)` from their own thread.
 """
 from __future__ import annotations
 
+import collections
+import re
 import sys
 import threading
 import time
@@ -15,6 +17,13 @@ from pathlib import Path
 
 RATE = 16000
 CHUNK = 1280                       # 80 ms, the frame size openWakeWord expects
+PREROLL_S = 1.2                    # audio kept from before the wake word fires (see LocalVoice.run)
+WAKE_PHRASE = re.compile(r"^\W*(?:(?:hey|hi|okay|ok|a)\W+)?(?:jarvis|jervis|travis)\b\W*", re.I)
+
+
+def strip_wake(text: str) -> str:
+    """'Hey Jarvis, shadow me.' -> 'shadow me.' (Whisper hears the wake word too, since it is in the pre-roll)."""
+    return WAKE_PHRASE.sub("", (text or "").strip(), count=1).strip()
 
 
 class Keyboard(threading.Thread):
@@ -88,23 +97,33 @@ class LocalVoice(threading.Thread):
         with self.sd.InputStream(samplerate=RATE, channels=1, dtype="int16", blocksize=CHUNK,
                                  device=self.device) as mic:
             self.log("[voice] say \"Hey Jarvis\"")
+            # The wake word model fires near the end of "Hey Jarvis", and people say the command in the same
+            # breath ("Hey Jarvis, shadow me"). Keeping the last moment of audio means the start of the command
+            # is never cut off; the wake phrase itself is then removed from the text.
+            preroll = collections.deque(maxlen=int(PREROLL_S * RATE / CHUNK))
             while not self.stopped.is_set():
                 block, _ = mic.read(CHUNK)
                 if self.speaking.is_set():
+                    preroll.clear()
                     continue
+                preroll.append(block[:, 0].copy())
                 scores = self.wake.predict(block[:, 0])
                 if self._wake_now.is_set() or max(scores.values()) >= self.threshold:
                     self._wake_now.clear()
                     self.wake.reset()
                     self.log("[voice] listening...")
-                    text = self._transcribe(self._record(mic))
+                    text = strip_wake(self._transcribe(self._record(mic, list(preroll))))
+                    preroll.clear()
                     if text:
                         self.on_text(text)
 
-    def _record(self, mic):
-        """Record until `silence_s` of quiet after speech, or `max_s`."""
+    def _record(self, mic, preroll=()):
+        """Record until `silence_s` of quiet after speech, or `max_s`, after the pre-roll audio."""
         np = self.np
-        frames, quiet, heard, noise = [], 0.0, False, None
+        frames, quiet, noise = list(preroll), 0.0, None
+        # Still talking when the wake word fired (the command came in the same breath)? Then wait for the pause
+        # after it rather than for speech to start.
+        heard = bool(frames) and float(np.sqrt(np.mean(frames[-1].astype(np.float32) ** 2))) > 400.0
         t0 = time.monotonic()
         while time.monotonic() - t0 < self.max_s:
             block, _ = mic.read(CHUNK)

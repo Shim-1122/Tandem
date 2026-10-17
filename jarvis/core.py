@@ -12,9 +12,11 @@ import time
 
 from . import actions
 from .brain import Brain, RuleBrain, is_stop
+from .games import RockPaperScissors
 from .perception import Perception
 from .reflexes import WAKE_GESTURES, Reflexes
 from .skills import Body
+from .voice import strip_wake
 
 
 class Jarvis:
@@ -33,10 +35,23 @@ class Jarvis:
         self._todo: "queue.Queue[tuple]" = queue.Queue()
         self._thinking = 0
         self.transcript: list[tuple[str, str]] = []
+        self.game: RockPaperScissors | None = None
+        self.rng = None                          # random generator for games (None: a fresh one)
+        self._speech: "queue.Queue[str]" = queue.Queue()
+        threading.Thread(target=self._speaker, daemon=True).start()
 
     # ------------------------------------------------------------------ actions and speech
     def act(self, name: str, args: dict | None = None, now: float | None = None, queue: bool = False) -> str | None:
         now = self.clock() if now is None else now
+        if name == "play_rock_paper_scissors":
+            if self.game is None:
+                with self._lock:
+                    self.body.set_shadow(False)
+                self.game = RockPaperScissors(self, now, rng=self.rng)
+            self.log("[jarvis] rock paper scissors")
+            return "rock paper scissors"
+        if name in ("freeze", "rest", "shadow") and self.game is not None:
+            self.game.done, self.game = True, None             # any of these ends a game in progress
         with self._lock:
             try:
                 done = actions.apply(self.body, name, args or {}, now, self.perception, queue=queue)
@@ -47,30 +62,47 @@ class Jarvis:
         return done
 
     def say(self, text: str):
+        """Speak without waiting: lines are played in order on the speaker thread, so the robot keeps moving."""
         if not text:
             return
         self.transcript.append(("jarvis", text))
         self.log(f"Jarvis: {text}")
-        if self.speak_fn:
-            try:
-                self.speak_fn(text)
-            except Exception as e:                    # a broken speaker must never stop the robot
-                self.log(f"[jarvis] speech failed: {e}")
+        self._speech.put(text)
+
+    def _speaker(self):
+        while True:
+            text = self._speech.get()
+            if self.speak_fn:
+                try:
+                    self.speak_fn(text)
+                except Exception as e:                # a broken speaker must never stop the robot
+                    self.log(f"[jarvis] speech failed: {e}")
 
     # ------------------------------------------------------------------ hearing
     def hear(self, text: str, wait: bool = False):
         """Something the person said or typed. Returns at once (or, with wait, after the reply is acted on)."""
-        text = (text or "").strip()
+        text = strip_wake(text)                       # "Hey Jarvis, shadow me" typed in full works too
         if not text:
             return
         self.transcript.append(("you", text))
         self.log(f"You: {text}")
         if is_stop(text):                              # safety: no queue, no model, right now
+            if self.game is not None:
+                self.game.finish(self.clock())
             self.act("freeze")
             self.say("Stopping.")
             return
+        if self.game is not None:                      # the game gets first look, on the loop's own thread
+            self._todo.put(("heard", text))
+            if wait:
+                self._drain(self.clock(), wait=True)
+            return
+        self._ask_brain(text, wait)
+
+    def _ask_brain(self, text: str, wait: bool = False):
         with self._lock:
-            scene, state = self.perception.describe(), self.body.state()
+            scene = self.perception.describe()
+            state = self.game.status() if self.game else self.body.state()
             self._thinking += 1
         th = threading.Thread(target=self._think, args=(text, scene, state), daemon=True)
         th.start()
@@ -84,7 +116,7 @@ class Jarvis:
         except Exception as e:
             self.log(f"[jarvis] brain error: {e}")
             reply, calls = RuleBrain().respond(text, scene, state)
-        self._todo.put((reply, calls))
+        self._todo.put(("reply", (reply, calls)))
         with self._lock:
             self._thinking -= 1
 
@@ -92,12 +124,17 @@ class Jarvis:
     def thinking(self) -> bool:
         return self._thinking > 0
 
-    def _drain(self, now):
+    def _drain(self, now, wait: bool = False):
         while True:
             try:
-                reply, calls = self._todo.get_nowait()
+                kind, item = self._todo.get_nowait()
             except queue.Empty:
                 return
+            if kind == "heard":
+                if self.game is None or not self.game.hear(item, now):
+                    self._ask_brain(item, wait)
+                continue
+            reply, calls = item
             for i, (name, args) in enumerate(calls):
                 self.act(name, args, now, queue=i > 0)   # several moves in one request run one after another
             self.say(reply)
@@ -112,8 +149,8 @@ class Jarvis:
             self.log(f"[sense] {ev}")
             if ev.kind == "gesture" and ev.data.get("gesture") in WAKE_GESTURES and self.on_wake:
                 self.on_wake()
-            if self.reflexes is None:
-                continue
+            if self.reflexes is None or self.game is not None:
+                continue                               # mid-game a fist or open palm is a throw, not a greeting
             with self._lock:
                 if self.body.shadow or self.body.frozen:
                     continue                           # copying or stopped: no surprise moves
@@ -125,6 +162,10 @@ class Jarvis:
                 self.act(name, args, now)
             self.say(speech)
         self._drain(now)
+        if self.game is not None:
+            self.game.update(now)
+            if self.game is not None and self.game.done:
+                self.game = None
         with self._lock:
             targets = self.body.targets(now, tracker, self.perception.head_direction())
         if self.robot is not None:

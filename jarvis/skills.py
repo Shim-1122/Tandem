@@ -5,7 +5,7 @@ Every value uses Tandem's column names and sign conventions (`R_shoulder_flexion
 arm through `robot.SerialRobot`.
 
 The body is built from layers, applied in this order every tick:
-    base       rest pose, or shadow mode (copy the person, as `live.py --sim` does)
+    base       rest pose, or shadow mode (mirror the person, or copy them joint for joint as `live.py --sim` does)
     hands      a held grip or hand shape per side (grip, release)
     attention  where the head and eyes look: at the person, at a direction, or nowhere
     motion     the current skill (wave, nod, point...), which overrides only the joints it moves
@@ -46,20 +46,22 @@ def speed_limit(col: str) -> float | None:
 
 
 def hand_shape(shape: str, amount: float = 1.0) -> dict:
-    """Finger angles for one hand (no side prefix). shape: open, fist, grip, point, thumbs_up, pinch."""
+    """Finger angles for one hand (no side prefix). shape: open, fist, grip, point, thumbs_up, pinch, peace."""
     g = max(0.0, min(1.0, amount))
-    curl = {"open": 0.0, "fist": 1.0, "grip": g, "thumbs_up": 1.0, "point": 1.0, "pinch": 0.6}.get(shape, 0.0)
+    curl = {"open": 0.0, "fist": 1.0, "grip": g, "thumbs_up": 1.0, "point": 1.0, "pinch": 0.6,
+            "peace": 1.0}.get(shape, 0.0)
     v = {}
     for f in FINGERS:
-        c = 0.0 if (shape == "point" and f == "index") else curl
+        c = 0.0 if (shape == "point" and f == "index") or (shape == "peace" and f in ("index", "middle")) else curl
         if shape == "pinch" and f == "index":
             c = 0.55
-        v.update({f"{f}_mcp_flex": 75 * c, f"{f}_mcp_abd": 0.0, f"{f}_pip": 95 * c, f"{f}_dip": 55 * c})
+        spread = {"index": 10.0, "middle": -10.0}.get(f, 0.0) if shape == "peace" else 0.0   # the V of scissors
+        v.update({f"{f}_mcp_flex": 75 * c, f"{f}_mcp_abd": spread, f"{f}_pip": 95 * c, f"{f}_dip": 55 * c})
     if shape == "thumbs_up":                       # thumb straight up, out of the fist
         v.update({"thumb_cmc_palmar": 10.0, "thumb_cmc_radial": 40.0, "thumb_cmc_rotation": 0.0,
                   "thumb_mcp": 0.0, "thumb_ip": 0.0})
     else:
-        t = 1.0 if shape in ("fist", "point") else (0.7 if shape == "pinch" else curl)
+        t = 1.0 if shape in ("fist", "point", "peace") else (0.7 if shape == "pinch" else curl)
         v.update({"thumb_cmc_palmar": 20 + 30 * t, "thumb_cmc_radial": 30 - 20 * t,
                   "thumb_cmc_rotation": 40 + 40 * t, "thumb_mcp": 10 + 30 * t, "thumb_ip": 10 + 30 * t})
     return v
@@ -144,6 +146,33 @@ def shrug(seconds: float = 2.0) -> Motion:
     return Motion("shrug", seconds, pose)
 
 
+RPS_HAND = {"rock": "fist", "paper": "open", "scissors": "peace"}
+RPS_ARM = {"shoulder_flexion": 30, "shoulder_abduction": 10, "shoulder_rotation": -25, "elbow_flexion": 95,
+           "forearm_rotation": 0, "wrist_flexion": 0, "wrist_deviation": 0}
+
+
+def rps_ready(side: str = "right", seconds: float = 30.0) -> Motion:
+    """Rock paper scissors, get set: forearm forward and turned a little out (so the hand is clear of the chest),
+    hand in a fist."""
+    return Motion("rps ready", seconds, lambda u: sided(side, {**RPS_ARM, **hand_shape("fist")}))
+
+
+def rps_count(beats: int = 3, beat_s: float = 0.6, side: str = "right") -> Motion:
+    """Pump the fist once per beat ("rock", "paper", "scissors"): down on the beat, back up between."""
+    def pose(u):
+        dip = math.sin(math.pi * min(1.0, (u % beat_s) / beat_s))        # 0 at each beat, 1 halfway, 0 again
+        return sided(side, {**RPS_ARM, "shoulder_flexion": 30 + 12 * dip, "elbow_flexion": 95 - 40 * dip,
+                            **hand_shape("fist")})
+    return Motion("rps count", beats * beat_s, pose)
+
+
+def rps_throw(choice: str, side: str = "right", seconds: float = 1.6) -> Motion:
+    """"Shoot!": forearm down to the front and the hand in the chosen shape, held so it can be seen."""
+    return Motion(f"rps {choice}", seconds, lambda u: sided(side, {
+        **RPS_ARM, "shoulder_flexion": 42, "elbow_flexion": 55, "forearm_rotation": 0 if choice == "scissors" else 70,
+        **hand_shape(RPS_HAND[choice])}))
+
+
 SKILLS = {"wave": wave, "nod": nod, "shake_head": shake_head, "thumbs_up": thumbs_up, "point": point,
           "reach": reach, "celebrate": celebrate, "shrug": shrug}
 
@@ -159,12 +188,26 @@ SHADOW_COLS = ("core_rotation", "neck_yaw", "neck_pitch", "neck_roll", "eye_yaw"
     p + c for p in PRE.values() for c in ARM + FINGER_COLS)
 
 
+# Mirror image: each side copies the other side's arm (the two arms already share sign conventions, mirrored
+# internally), and turning or tilting to one side becomes the other.
+MIRROR_NEGATE = {"core_rotation", "neck_yaw", "neck_roll", "eye_yaw"}
+
+
+def mirror_source(col: str) -> str:
+    if col.startswith("R_"):
+        return "L_" + col[2:]
+    if col.startswith("L_"):
+        return "R_" + col[2:]
+    return col
+
+
 # ---------------------------------------------------------------------- body
 class Body:
     """Holds the robot's state and turns it into joint targets: `targets(now, tracker_values, look_dir)`."""
 
     def __init__(self, blink: bool = True, seed: int = 0):
         self.shadow = False
+        self.mirror = True                                # shadow as a mirror image (see set_shadow)
         self.frozen = False
         self.motion: Motion | None = None
         self.queue: list[Motion] = []
@@ -207,9 +250,14 @@ class Body:
         self.frozen = True
         self.motion, self.queue = None, []
 
-    def set_shadow(self, on: bool):
+    def set_shadow(self, on: bool, mirror: bool | None = None):
+        """Copy the person. mirror=True (the default): like a reflection, facing you the robot moves its left arm
+        when you move your right, and turns its head the same way you see yours turn. mirror=False: joint for
+        joint, its right arm copies your right arm (what live.py --sim does)."""
         self.frozen = False
         self.shadow = on
+        if mirror is not None:
+            self.mirror = mirror
         if on:
             self.motion, self.queue = None, []
 
@@ -221,7 +269,7 @@ class Body:
         if self.frozen:
             return "frozen"
         if self.shadow:
-            return "shadowing"
+            return "mirroring you" if self.mirror else "copying you"
         return self.motion.name if self.motion else "idle"
 
     # ------------------------------------------------------------- targets
@@ -233,9 +281,9 @@ class Body:
         goal = rest_pose()
         if self.shadow and tracker:
             for c in SHADOW_COLS:
-                v = _num(tracker.get(c))
+                v = _num(tracker.get(mirror_source(c) if self.mirror else c))
                 if math.isfinite(v):
-                    goal[c] = v
+                    goal[c] = -v if self.mirror and c in MIRROR_NEGATE else v
         for sd, (shape, amount) in self.grips.items():
             goal.update(sided(sd, hand_shape(shape, amount)))
         if not self.shadow:

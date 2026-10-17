@@ -6,7 +6,8 @@
     python scripts/jarvis.py --model llama3.1:8b      # a different Ollama model (default qwen2.5:7b)
     python scripts/jarvis.py --no-camera              # robot and commands only, no tracking
     python scripts/jarvis.py --demo                   # a scripted visitor instead of the camera
-    python scripts/jarvis.py --demo --video jarvis.mp4   # save the demo as a video (no windows needed)
+    python scripts/jarvis.py --demo games             # scripted voice commands: rock paper scissors, then shadow
+    python scripts/jarvis.py --demo games --video g.mp4   # save a demo as a video (no windows needed)
 
 Keys in the video windows: q quit, space stop (freeze), r rest, s shadow mode on and off, plus Tandem's own keys.
 Type in the terminal at any time; "stop" or "freeze" always stops the robot at once.
@@ -40,7 +41,9 @@ def parse_args(argv=None):
     ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes"], default="front")
     src = ap.add_mutually_exclusive_group()
     src.add_argument("--no-camera", action="store_true", help="no tracking (commands only)")
-    src.add_argument("--demo", action="store_true", help="a scripted visitor instead of the camera")
+    src.add_argument("--demo", nargs="?", const="visitor", choices=["visitor", "games"],
+                     help="a scripted person instead of the camera: visitor (reflexes and commands) or games "
+                          "(rock paper scissors, then shadow mode)")
     ap.add_argument("--video", type=Path, help="with --demo: write the robot to this video instead of a window")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--torso", choices=["auto", "hips", "desk"], default="desk")
@@ -81,18 +84,22 @@ def make_voice(a, jarvis):
 
 def run_demo_video(a, jarvis, robot, fps=30, size=(960, 540)):
     import cv2
+    import random
     from jarvis import demo
+    script = demo.SCRIPTS[a.demo]()
+    jarvis.rng = random.Random(6)                    # the same robot throws every time, for a repeatable video
     out = cv2.VideoWriter(str(a.video), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
-    said, clock = 0, [0.0]
+    clock = [0.0]
     jarvis.clock = lambda: clock[0]                  # the video's own time, not the wall clock
-    for k in range(int(demo.LENGTH * fps)):
+    for k in range(int(script.LENGTH * fps)):
         t = clock[0] = k / fps
-        while said < len(demo.SAYS) and demo.SAYS[said][0] <= t:
-            jarvis.hear(demo.SAYS[said][1], wait=True)
-            said += 1
-        jarvis.tick(t, demo.scenario(t))
+        values, words = script.step(t, jarvis)
+        if words:
+            jarvis.hear(words, wait=True)
+        jarvis.tick(t, values)
         img = robot.render(a.sim_camera, *size)[:, :, ::-1].copy()
-        lines = [f"t {t:4.1f}s   {jarvis.body.state()}"] + [f"{who}: {txt}" for who, txt in jarvis.transcript[-3:]]
+        state = jarvis.game.status() if jarvis.game else jarvis.body.state()
+        lines = [f"t {t:4.1f}s   {state}"] + [f"{who}: {txt}" for who, txt in jarvis.transcript[-4:]]
         for i, line in enumerate(lines):
             cv2.putText(img, line, (14, 30 + 26 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2,
                         cv2.LINE_AA)
@@ -129,7 +136,7 @@ def main(argv=None):
     import cv2
     from jarvis import demo
     start = time.monotonic()
-    said = 0
+    script = demo.SCRIPTS[a.demo]() if a.demo else None
     try:
         while True:
             now = time.monotonic()
@@ -140,19 +147,18 @@ def main(argv=None):
                     app.update()
                     cv2.imshow("Tandem", app.render(frame))
                 values = app.values()
-            elif a.demo:
-                t = now - start
-                values = demo.scenario(t % demo.LENGTH)
-                if said < len(demo.SAYS) and demo.SAYS[said][0] <= t:
-                    jarvis.hear(demo.SAYS[said][1])
-                    said += 1
+            elif script is not None:
+                values, words = script.step(now - start, jarvis)
+                if words:
+                    jarvis.hear(words)
             else:
                 values = {}
                 time.sleep(1 / 60)
             jarvis.tick(now, values)
             if robot is not None:
                 img = robot.render(a.sim_camera, 800, 600)[:, :, ::-1].copy()
-                cv2.putText(img, f"Jarvis: {jarvis.body.state()}" + ("  (thinking)" if jarvis.thinking else ""),
+                state = jarvis.game.status() if jarvis.game else jarvis.body.state()
+                cv2.putText(img, f"Jarvis: {state}" + ("  (thinking)" if jarvis.thinking else ""),
                             (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
                 cv2.imshow("Jarvis robot", img)
             key = cv2.waitKey(1) & 0xFF if (robot is not None or app is not None) else 255
