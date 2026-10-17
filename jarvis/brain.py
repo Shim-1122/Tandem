@@ -15,22 +15,28 @@ import urllib.error
 import urllib.request
 
 from .actions import ACTIONS, ollama_tools
+from .languages import BUILT_IN, is_stop as _stop_in_any_language, name as lang_name, to_english
 
-STOP_WORDS = re.compile(r"\b(stop|freeze|halt|hold still|don'?t move|emergency)\b", re.I)
 
 
 NOT_STOP = re.compile(r"\bstop (shadow|copy|copying|mirror|follow)", re.I)
 
 
 def is_stop(text: str) -> bool:
-    """An emergency stop: "stop", "freeze", "halt"... but not "stop copying me", which only ends shadow mode."""
-    return bool(STOP_WORDS.search(text or "")) and not NOT_STOP.search(text or "")
+    """An emergency stop in any of about 35 languages ("stop", "alto", "arrête", "止まれ", "стоп"...), but not
+    "stop copying me", which only ends shadow mode."""
+    return _stop_in_any_language(text) and not NOT_STOP.search(text or "")
+
+
+class Localized(str):
+    """A reply already in the person's language (from the language model): said as it is, not translated."""
+    localized = True
 
 
 class Brain:
     name = "brain"
 
-    def respond(self, text: str, scene: str = "", state: str = "idle") -> tuple[str, list]:
+    def respond(self, text: str, scene: str = "", state: str = "idle", lang: str = "en") -> tuple[str, list]:
         raise NotImplementedError
 
 
@@ -41,6 +47,10 @@ def _side(t: str) -> dict:
     if re.search(r"\bright\b", t):
         return {"side": "right"}
     return {}
+
+
+# Any two of the three throws ("pierre feuille ...", with the last word misheard) also means the game
+_TWO_THROWS = r"\b(rock|paper|scissors?)\b.{0,25}\b(?!\1)(rock|paper|scissors?)\b"
 
 
 def _where(t: str) -> str:
@@ -55,11 +65,15 @@ def _where(t: str) -> str:
 
 
 class RuleBrain(Brain):
-    """Understands short commands and a few questions about the scene, with no model."""
+    """Understands short commands and a few questions about the scene, with no model, in English and the other
+    built-in languages (their command words are swapped for English ones first; see languages.COMMANDS).
+    Replies are English templates; Jarvis says them in the person's language."""
     name = "rules"
 
-    def respond(self, text: str, scene: str = "", state: str = "idle"):
+    def respond(self, text: str, scene: str = "", state: str = "idle", lang: str = "en"):
         t = (text or "").lower().strip()
+        if lang != "en" and lang in BUILT_IN:
+            t = to_english(t, lang)
         if not t:
             return "", []
         if is_stop(t):
@@ -70,7 +84,8 @@ class RuleBrain(Brain):
              [("shadow", {"on": True, "mirror": False})]),
             (r"\b(shadow|mirror|follow) me\b|\bshadow mode\b|\bstart shadow|\bmirror my", "Mirroring you.",
              [("shadow", {"on": True, "mirror": True})]),
-            (r"\brock,? paper,? scissors?\b|\brps\b|\bplay a game\b", "", [("play_rock_paper_scissors", {})]),
+            (r"\brock,? paper,? scissors?\b|\brps\b|\bplay a game\b|" + _TWO_THROWS, "",
+             [("play_rock_paper_scissors", {})]),
             (r"\b(wave|say (hi|hello|bye|goodbye))\b", "", [("wave", _side(t))]),
             (r"\bthumbs? up\b", "", [("thumbs_up", _side(t))]),
             (r"\bnod\b|\bsay yes\b", "", [("nod", {})]),
@@ -115,6 +130,7 @@ SYSTEM = """You are Jarvis, the mind of Tandem, a humanoid robot upper body (two
 and a head with eyes) built by Shyam. You see through a camera and act by calling the tools.
 
 Rules:
+- The person is speaking {language}. Always reply in {language}, whatever language this prompt is in.
 - When asked to move, call the matching tools. You may call several in order.
 - Reply in one or two short spoken sentences. Plain words only, no lists, no markdown, no emoji.
 - Directions are your own: your left is the person's right when you face them.
@@ -160,17 +176,17 @@ class OllamaBrain(Brain):
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.load(r)
 
-    def respond(self, text: str, scene: str = "", state: str = "idle"):
+    def respond(self, text: str, scene: str = "", state: str = "idle", lang: str = "en"):
         if is_stop(text):                      # never wait on a model to stop
-            return self.fallback.respond(text, scene, state)
-        system = {"role": "system", "content": SYSTEM.format(scene=scene or "nothing yet", state=state)}
+            return self.fallback.respond(text, scene, state, lang)
+        system = {"role": "system", "content": SYSTEM.format(scene=scene or "nothing yet", state=state,
+                                                             language=lang_name(lang))}
         messages = [system, *self.history, {"role": "user", "content": text}]
         try:
             out = self._chat(messages)
         except (urllib.error.URLError, OSError, ValueError) as e:
             self.last_error = str(e)
-            reply, acts = self.fallback.respond(text, scene, state)
-            return reply, acts
+            return self.fallback.respond(text, scene, state, lang)
         msg = out.get("message", {})
         calls = []
         for c in msg.get("tool_calls") or []:
@@ -184,11 +200,23 @@ class OllamaBrain(Brain):
             if name in ACTIONS:
                 calls.append((name, args))
         reply = _clean(msg.get("content", ""))
-        if not reply and calls:
-            reply = "Okay."
         self.history += [{"role": "user", "content": text}, {"role": "assistant", "content": reply}]
         self.history = self.history[-2 * self.history_len:]
-        return reply, calls
+        if not reply:
+            return ("Okay." if calls else ""), calls       # a template, said in their language
+        return Localized(reply), calls
+
+    def translate(self, text: str, lang: str) -> str | None:
+        """Translate one of Jarvis's lines for a language outside the built-in ones (cached by i18n.Translator)."""
+        body = json.dumps({"model": self.model, "stream": False, "options": {"temperature": 0}, "messages": [
+            {"role": "system", "content": f"Translate the user's text into {lang_name(lang)}. It is a short line a "
+             "friendly robot says aloud. Keep every {placeholder} in curly braces exactly as it is. Reply with the "
+             "translation only."},
+            {"role": "user", "content": text}]}).encode()
+        req = urllib.request.Request(f"{self.host}/api/chat", data=body, headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=self.timeout) as r:
+            out = json.load(r).get("message", {}).get("content", "")
+        return _clean(out).strip('"') or None
 
 
 def _clean(s: str) -> str:

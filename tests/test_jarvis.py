@@ -154,10 +154,10 @@ def test_reflex_mirrors_the_hand_and_has_a_cooldown():
 
 
 def test_greeting_uses_the_name():
-    acts, speech = Reflexes().react(Event("person_arrived", 0.0, {"name": "shyam"}), 0.0)
-    assert speech == "Hello, shyam." and ("look", {"at": "me"}) in acts
-    _, speech = Reflexes().react(Event("person_arrived", 0.0, {"name": "unknown"}), 0.0)
-    assert speech == "Hello."
+    acts, (template, values) = Reflexes().react(Event("person_arrived", 0.0, {"name": "shyam"}), 0.0)
+    assert template.format(**values) == "Hello, shyam." and ("look", {"at": "me"}) in acts
+    _, (template, values) = Reflexes().react(Event("person_arrived", 0.0, {"name": "unknown"}), 0.0)
+    assert template == "Hello."
 
 
 # ------------------------------------------------------------------ brains
@@ -434,3 +434,237 @@ def test_game_night_demo_runs_on_the_mujoco_robot():
     assert max(left_abd) - min(left_abd) > 30                          # its left arm followed your right
     assert not j.body.shadow                                           # "stop mirroring me" ended it
     robot.close()
+
+
+# ------------------------------------------------------------------ languages
+from jarvis import i18n, languages  # noqa: E402
+
+
+@pytest.mark.parametrize("heard,whisper,command,lang", [
+    ("Hey Jarvis, shadow me", "en", "shadow me", "en"),
+    ("Wake up Jarvis, wave", "en", "wave", "en"),
+    ("Oye Jarvis, imítame", "es", "imítame", "es"),
+    ("Despierta Jarvis", "es", "", "es"),
+    ("Hey Jarvis, piedra papel o tijera", "es", "piedra papel o tijera", "es"),     # shared "hey": Whisper decides
+    ("Réveille-toi Jarvis, salue", "fr", "salue", "fr"),
+    ("Hallo Jarvis, mach mich nach", "de", "mach mich nach", "de"),
+    ("Jarvis, wach auf! Wink mal", "de", "Wink mal", "de"),
+    ("Ehi Jarvis, saluta", "it", "saluta", "it"),
+    ("Acorda Jarvis, me imita", "pt", "me imita", "pt"),
+    ("अरे जार्विस, हाथ हिलाओ", "hi", "हाथ हिलाओ", "hi"),
+    ("嘿贾维斯，石头剪刀布", "zh", "石头剪刀布", "zh"),
+    ("ジャービス、起きて。じゃんけんしよう", "ja", "じゃんけんしよう", "ja"),
+    ("자비스 일어나, 따라해", "ko", "따라해", "ko"),
+    ("Джарвис, проснись, помаши", "ru", "помаши", "ru"),
+    ("يا جارفيس، قلدني", "ar", "قلدني", "ar"),
+    ("Hey Jarvis, zwaai eens", "nl", "zwaai eens", "nl"),                         # not built in: Whisper decides
+])
+def test_wake_phrase_sets_the_language(heard, whisper, command, lang):
+    found = languages.find_wake(heard)
+    assert found is not None and found[0] == command
+    assert languages.wake_language(heard, whisper, 0.9, previous="en") == lang
+
+
+def test_wake_words_beat_a_wrong_whisper_guess_and_only_lead_a_sentence():
+    assert languages.wake_language("Despierta Jarvis", "pt", 0.6) == "es"       # the wake word decides
+    assert languages.wake_language("Hey Jarvis", "de", 0.3, previous="ja") == "ja"   # unsure: keep the last one
+    assert languages.find_wake("wave at Jarvis") is None
+    assert languages.find_wake("I told Jarvis to wave") is None
+    assert languages.find_wake("no wake word here") is None
+
+
+@pytest.mark.parametrize("text", ["stop", "FREEZE!", "alto", "detente", "arrête", "stopp", "fermati", "pare", "रुको",
+                                  "停下", "止まれ", "멈춰", "стоп", "توقف", "stoppen", "dur", "stanna", "berhenti",
+                                  "σταμάτα", "עצור", "dừng lại"])
+def test_stop_in_many_languages(text):
+    from jarvis.brain import is_stop
+    assert is_stop(text)
+
+
+def test_these_are_not_stops():
+    from jarvis.brain import is_stop
+    for text in ("stop copying me", "para mí, saluda", "wave", "hola", "parle", "camera"):
+        assert not is_stop(text), text
+
+
+@pytest.mark.parametrize("lang,text,action", [
+    ("es", "imítame", ("shadow", {"on": True, "mirror": True})),
+    ("es", "saluda con la mano izquierda", ("wave", {"side": "left"})),
+    ("es", "piedra, papel o tijera", ("play_rock_paper_scissors", {})),
+    ("fr", "imite-moi", ("shadow", {"on": True, "mirror": True})),
+    ("fr", "pierre feuille ciseaux", ("play_rock_paper_scissors", {})),
+    ("de", "mach mich nach", ("shadow", {"on": True, "mirror": True})),
+    ("de", "schere stein papier", ("play_rock_paper_scissors", {})),
+    ("it", "imitami", ("shadow", {"on": True, "mirror": True})),
+    ("it", "sasso carta forbice", ("play_rock_paper_scissors", {})),
+    ("pt", "me imita", ("shadow", {"on": True, "mirror": True})),
+    ("pt", "pedra papel tesoura", ("play_rock_paper_scissors", {})),
+    ("hi", "मेरी नकल करो", ("shadow", {"on": True, "mirror": True})),
+    ("hi", "पत्थर कागज़ कैंची", ("play_rock_paper_scissors", {})),
+    ("zh", "模仿我", ("shadow", {"on": True, "mirror": True})),
+    ("zh", "石头剪刀布", ("play_rock_paper_scissors", {})),
+    ("ja", "真似して", ("shadow", {"on": True, "mirror": True})),
+    ("ja", "じゃんけんしよう", ("play_rock_paper_scissors", {})),
+    ("ko", "따라해", ("shadow", {"on": True, "mirror": True})),
+    ("ko", "가위바위보", ("play_rock_paper_scissors", {})),
+    ("ru", "повторяй за мной", ("shadow", {"on": True, "mirror": True})),
+    ("ru", "камень ножницы бумага", ("play_rock_paper_scissors", {})),
+    ("ar", "قلدني", ("shadow", {"on": True, "mirror": True})),
+    ("ar", "حجر ورقة مقص", ("play_rock_paper_scissors", {})),
+    ("ru", "помаши левой рукой", ("wave", {"side": "left"})),
+    ("ja", "左手で手を振って", ("wave", {"side": "left"})),
+])
+def test_commands_in_the_built_in_languages_need_no_model(lang, text, action):
+    _, acts = RuleBrain().respond(text, lang=lang)
+    assert acts[0] == action
+
+
+def test_every_built_in_language_has_every_line_with_its_placeholders():
+    import string
+    fields = lambda s: sorted(f for _, f, _, _ in string.Formatter().parse(s) if f)   # noqa: E731
+    assert set(i18n.CATALOG_LANGS) | {"en"} == set(languages.BUILT_IN)
+    for lang, rows in i18n.CATALOG_LANGS.items():
+        assert len(rows) == len(i18n.TEMPLATES), lang
+        for en, local in zip(i18n.TEMPLATES, rows):
+            assert fields(en) == fields(local), (lang, en, local)
+            assert "—" not in local
+    for lang in languages.BUILT_IN:
+        assert languages.voice_for(lang) and lang in languages.THROWS and lang in languages.GAME_WORDS
+
+
+def test_every_piper_voice_name_is_well_formed():
+    import re
+    for lang, v in languages.VOICES.items():
+        assert re.fullmatch(rf"{lang}_[A-Z]{{2}}-[\w]+-(x_low|low|medium|high)", v), v
+
+
+def test_jarvis_answers_in_the_language_of_the_wake_phrase():
+    spoken = []
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0, speak=lambda text, lang: spoken.append((text, lang)))
+    j.hear("Oye Jarvis, imítame", wait=True)
+    assert j.lang == "es" and j.body.shadow and j.transcript[-1] == ("jarvis", "Te imito como un espejo.")
+    j.hear("Hey Jarvis, stop mirroring me", wait=True, lang="en")
+    assert j.lang == "en" and not j.body.shadow and j.transcript[-1] == ("jarvis", "Shadow mode off.")
+    import time as _t
+    for _ in range(50):
+        if len(spoken) >= 2:
+            break
+        _t.sleep(0.02)
+    assert spoken[0] == ("Te imito como un espejo.", "es") and spoken[1] == ("Shadow mode off.", "en")
+
+
+def test_rock_paper_scissors_in_japanese_by_voice():
+    import random
+    j = Jarvis(log=lambda *a: None, clock=lambda: 0.0)
+    j.rng = random.Random(2)
+    j.hear("ジャービス、起きて。じゃんけんしよう", wait=True)
+    assert j.lang == "ja" and j.game is not None
+    j.hear("いいよ", wait=True)                                          # "ready" in Japanese
+    assert j.game.state == "count"
+    t = 0.0
+    while j.game.state != "again":
+        if j.game.state == "read" and j.game.said_throw is None:
+            j.hear("チョキ", wait=True)                                   # scissors
+        j.tick(t, {})
+        t += 1 / 30
+    assert j.game.result[1] == "scissors"
+    said = [txt for who, txt in j.transcript if who == "jarvis"]
+    assert said[1:5] == ["最初は...", "グー...", "じゃんけん...", "ぽん！"]
+    assert said[-1].endswith("もう一回？")
+    j.hear("もういい", wait=True)                                         # "that's enough"
+    j.tick(t + 1, {})
+    assert j.game is None and j.transcript[-1][1].startswith("いい勝負でした")
+
+
+def test_other_languages_use_the_model_translation_once():
+    calls = []
+
+    def fake_translate(text, lang):
+        calls.append(text)
+        return {"Mirroring you.": "Ik spiegel je.", "Hello, {name}.": "Hallo, {name}."}.get(text)
+    import tempfile
+    t = i18n.Translator(fake_translate, path=tempfile.mkdtemp() + "/translations.json")
+    assert i18n.tr("Mirroring you.", "nl", t) == "Ik spiegel je."
+    assert i18n.tr("Mirroring you.", "nl", t) == "Ik spiegel je." and calls == ["Mirroring you."]   # cached
+    assert i18n.tr("Hello, {name}.", "nl", t, name="Shyam") == "Hallo, Shyam."
+    assert i18n.Translator(path=t.path).get("Mirroring you.", "nl") == "Ik spiegel je."          # kept on disk
+    assert i18n.tr("Relaxing.", "nl") == "Relaxing."                                             # no model: English
+
+
+def test_ollama_is_told_the_language_and_its_reply_is_not_translated_again(ollama):
+    _FakeOllama.reply = {"message": {"role": "assistant", "content": "¡Claro! Te saludo.",
+                                     "tool_calls": [{"function": {"name": "wave", "arguments": {}}}]}}
+    try:
+        j = Jarvis(brain=OllamaBrain(host=ollama), log=lambda *a: None, clock=lambda: 0.0)
+        j.hear("Oye Jarvis, salúdame por favor", wait=True)
+        assert "Spanish" in _FakeOllama.seen[-1]["messages"][0]["content"]
+        assert j.transcript[-1] == ("jarvis", "¡Claro! Te saludo.") and j.body.motion.name == "wave right"
+    finally:
+        del _FakeOllama.reply
+
+
+class _FakeSegment:
+    def __init__(self, text):
+        self.text = text
+
+
+class _FakeInfo:
+    def __init__(self, lang, prob):
+        self.language, self.language_probability = lang, prob
+
+
+class _FakeWhisper:
+    """Pretends to transcribe: the 'audio' is a dict of what each language setting would hear."""
+    def transcribe(self, audio, language=None, **kw):
+        text = audio.get(language, audio[None])
+        return [_FakeSegment(text)], _FakeInfo(audio["detected"], audio.get("prob", 0.9))
+
+
+def _listener(got):
+    from jarvis.voice import Listener
+    lst = Listener.__new__(Listener)
+    lst.stt, lst.lang, lst.log = _FakeWhisper(), "en", (lambda *a: None)
+    lst.on_text = lambda text, lang: got.append((text, lang))
+    lst.follow_up_s = 0.1
+    return lst
+
+
+def test_voice_finds_the_command_and_language():
+    got = []
+    lst = _listener(got)
+    lst._handle({None: "Oye Jarvis, imítame", "detected": "es"}, mic=None)
+    lst._handle({None: "nice weather today", "detected": "en"}, mic=None)          # no wake word: ignored
+    lst._handle({None: "Despierta Jarvis, saluda", "detected": "pt", "prob": 0.55,
+                 "es": "Despierta Jarvis, saluda"}, mic=None)                       # re-heard in Spanish
+    assert got == [("imítame", "es"), ("saluda", "es")]
+
+
+def test_voice_after_a_wake_gesture_takes_the_whole_phrase():
+    got = []
+    lst = _listener(got)
+    lst.lang = "fr"
+    lst._handle({None: "salue", "detected": "fr"}, mic=None, forced=True)
+    assert got == [("salue", "fr")]
+
+
+@pytest.mark.parametrize("heard,lang", [
+    # what Whisper (small, with the Jarvis hint) wrote for Piper speaking each wake phrase, in testing
+    ("o de Jarvis imítame", "es"), ("Hallo Jarvis, mach mich nach.", "de"), ("औरे Jarvis, हाद हिलाओ", "hi"),
+    ("Жарvis, проснись по маширукой.", "ru"), ("JARVIS動きて、じゃんけんしよう", "ja"), ("يا جار فيس قلدني", "ar"),
+    ("Hey Harvis, wave", "en"), ("じゃあビス、手を振って", "ja"), ("जारवेस, नकल करो", "hi"),
+    ("o dejarvis imítame", "es"), ("A Cora de Jarvis me imita.", "pt"),
+])
+def test_speech_near_misses_still_wake(heard, lang):
+    assert languages.wake_language(heard, lang, 0.9) == lang
+
+
+def test_fuzzy_name_does_not_match_ordinary_words():
+    for text in ("it behaves well", "the jars", "Travis Scott", "chavez", "Harvard"):
+        assert languages.JARVIS_RE.search(text) is None, text
+
+
+def test_two_of_three_throws_start_the_game():
+    assert RuleBrain().respond("pierre feuillis-zo", lang="fr")[1] == [("shrug", {})]   # one throw: not enough
+    assert RuleBrain().respond("pierre feuille ciseaux", lang="fr")[1][0][0] == "play_rock_paper_scissors"
+    assert RuleBrain().respond("piedra y papel", lang="es")[1][0][0] == "play_rock_paper_scissors"
+    assert RuleBrain().respond("paper paper", lang="en")[1] != [("play_rock_paper_scissors", {})]

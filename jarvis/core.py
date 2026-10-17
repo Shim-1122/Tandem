@@ -13,10 +13,11 @@ import time
 from . import actions
 from .brain import Brain, RuleBrain, is_stop
 from .games import RockPaperScissors
+from .i18n import Translator, tr
+from .languages import find_wake, name as lang_name
 from .perception import Perception
 from .reflexes import WAKE_GESTURES, Reflexes
 from .skills import Body
-from .voice import strip_wake
 
 
 class Jarvis:
@@ -36,6 +37,8 @@ class Jarvis:
         self._thinking = 0
         self.transcript: list[tuple[str, str]] = []
         self.game: RockPaperScissors | None = None
+        self.lang = "en"                         # the language of the conversation (set by each wake phrase)
+        self.translator = Translator(getattr(self.brain, "translate", None))
         self.rng = None                          # random generator for games (None: a fresh one)
         self._speech: "queue.Queue[str]" = queue.Queue()
         threading.Thread(target=self._speaker, daemon=True).start()
@@ -61,27 +64,46 @@ class Jarvis:
         self.log(f"[jarvis] {done}")
         return done
 
-    def say(self, text: str):
-        """Speak without waiting: lines are played in order on the speaker thread, so the robot keeps moving."""
+    def local(self, template: str, **values) -> str:
+        """An English template (i18n.TEMPLATES) in the conversation's language."""
+        return tr(template, self.lang, self.translator, **values)
+
+    def say(self, text, **values):
+        """Speak without waiting: lines are played in order on the speaker thread, so the robot keeps moving.
+        `text` is an English template (said in the conversation's language) or a reply already in that language
+        from the language model (brain.Localized)."""
         if not text:
             return
+        if isinstance(text, tuple):              # (template, values) from a reflex
+            text, values = text
+        if not getattr(text, "localized", False):
+            text = self.local(text, **values)
         self.transcript.append(("jarvis", text))
         self.log(f"Jarvis: {text}")
-        self._speech.put(text)
+        self._speech.put((text, self.lang))
 
     def _speaker(self):
         while True:
-            text = self._speech.get()
+            text, lang = self._speech.get()
             if self.speak_fn:
                 try:
-                    self.speak_fn(text)
+                    self.speak_fn(text, lang)
                 except Exception as e:                # a broken speaker must never stop the robot
                     self.log(f"[jarvis] speech failed: {e}")
 
     # ------------------------------------------------------------------ hearing
-    def hear(self, text: str, wait: bool = False):
-        """Something the person said or typed. Returns at once (or, with wait, after the reply is acted on)."""
-        text = strip_wake(text)                       # "Hey Jarvis, shadow me" typed in full works too
+    def hear(self, text: str, wait: bool = False, lang: str | None = None):
+        """Something the person said (with the language the voice front end heard) or typed. Returns at once
+        (or, with wait, after the reply is acted on). Typed text may start with a wake phrase too: "Oye Jarvis,
+        imítame" switches to Spanish like saying it would."""
+        found = find_wake(text)
+        if found is not None:
+            text, hint = found
+            lang = lang or hint
+        text = (text or "").strip()
+        if lang and lang != self.lang:
+            self.lang = lang
+            self.log(f"[jarvis] language: {lang_name(lang)}")
         if not text:
             return
         self.transcript.append(("you", text))
@@ -112,10 +134,10 @@ class Jarvis:
 
     def _think(self, text, scene, state):
         try:
-            reply, calls = self.brain.respond(text, scene, state)
+            reply, calls = self.brain.respond(text, scene, state, self.lang)
         except Exception as e:
             self.log(f"[jarvis] brain error: {e}")
-            reply, calls = RuleBrain().respond(text, scene, state)
+            reply, calls = RuleBrain().respond(text, scene, state, self.lang)
         self._todo.put(("reply", (reply, calls)))
         with self._lock:
             self._thinking -= 1

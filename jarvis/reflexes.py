@@ -6,14 +6,15 @@ or a lingering expression does not repeat the reaction. Edit RULES to change Jar
 A rule: (event kind, match, actions, speech, cooldown seconds)
     match    dict of event data that must be equal (e.g. {"gesture": "thumbs_up"}), or {}
     actions  list of (action name, args) from actions.ACTIONS; "{side}" in args is the event's hand
-    speech   what to say ("{name}" and "{object}" filled from the event), or None
+    speech   what to say, an English template from i18n.TEMPLATES ("{name}" and "{object}" filled from the event),
+             or None. Jarvis says it in the language you last spoke.
 """
 from __future__ import annotations
 
 from .perception import Event
 
 RULES = [
-    ("person_arrived", {}, [("look", {"at": "me"}), ("wave", {"side": "right"})], "Hello{name_part}.", 30.0),
+    ("person_arrived", {}, [("look", {"at": "me"}), ("wave", {"side": "right"})], "Hello, {name}.", 30.0),
     ("person_recognized", {}, [("nod", {})], "Oh, it's you, {name}.", 60.0),
     ("person_left", {}, [("rest", {})], None, 5.0),
     ("gesture", {"gesture": "open_palm"}, [("wave", {"side": "mirror"})], None, 6.0),
@@ -38,7 +39,7 @@ class Reflexes:
         self._last: dict[int, float] = {}
 
     def react(self, event: Event, now: float):
-        """The actions and speech for an event: (list of (name, args), speech or None)."""
+        """The actions and speech for an event: (list of (name, args), (template, values) or None)."""
         for i, (kind, match, acts, speech, cooldown) in enumerate(self.rules):
             if kind != event.kind or any(event.data.get(k) != v for k, v in match.items()):
                 continue
@@ -51,11 +52,11 @@ class Reflexes:
             for name, args in acts:
                 a = {k: (mirror if v == "mirror" else side if v == "{side}" else v) for k, v in args.items()}
                 out.append((name, a))
-            text = None
+            said = None
             if speech:
                 name = event.data.get("name") or ""
-                data = {"name": name, "object": event.data.get("object", "").replace("_", " "),
-                        "name_part": f", {name}" if name and name != "unknown" else ""}
-                text = speech.format(**data)
-            return out, text
+                if "{name}" in speech and (not name or name == "unknown"):
+                    speech = "Hello."                         # someone it does not know
+                said = (speech, {"name": name, "object": event.data.get("object", "").replace("_", " ")})
+            return out, said
         return [], None

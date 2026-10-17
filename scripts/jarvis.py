@@ -1,7 +1,8 @@
 """Jarvis: the locally hosted brain for the Tandem robot. Sees you through Tandem, hears you, drives the robot.
 
     python scripts/jarvis.py                          # camera + simulated robot, type commands in this terminal
-    python scripts/jarvis.py --voice                  # also "Hey Jarvis" by voice, replies spoken (Piper)
+    python scripts/jarvis.py --voice                  # also "Hey Jarvis" by voice in any language, replies spoken
+    python scripts/jarvis.py --voice --whisper base   # lighter speech recognition for a slower computer
     python scripts/jarvis.py --brain rules            # no language model: keyword commands only
     python scripts/jarvis.py --model llama3.1:8b      # a different Ollama model (default qwen2.5:7b)
     python scripts/jarvis.py --no-camera              # robot and commands only, no tracking
@@ -31,10 +32,19 @@ def parse_args(argv=None):
                     help="ollama: a local language model (falls back to rules if Ollama is not running)")
     ap.add_argument("--model", default="qwen2.5:7b", help="Ollama model with tool support")
     ap.add_argument("--ollama-host", default="http://localhost:11434")
-    ap.add_argument("--voice", action="store_true", help="listen for 'Hey Jarvis' and speak replies")
+    ap.add_argument("--voice", action="store_true",
+                    help="listen for 'Hey Jarvis' (in any language) and speak replies in the language you used")
+    ap.add_argument("--wake-engine", choices=["whisper", "oww"], default="whisper",
+                    help="whisper: hears 'Jarvis' in any language (more processor); oww: openWakeWord's English "
+                         "'Hey Jarvis' model (lighter)")
+    ap.add_argument("--whisper", default="small",
+                    help="faster-whisper model: small (default; tested best across languages), base (faster, much "
+                         "weaker outside English), medium (best, needs a fast computer); .en models are English only")
+    ap.add_argument("--lang", default="en", help="language to start in (two letters, like es or hi); the wake "
+                    "phrase changes it")
     ap.add_argument("--voice-model", type=Path, default=Path("models/en_GB-alan-medium.onnx"),
-                    help="Piper voice (.onnx); download with: python -m piper.download_voices en_GB-alan-medium")
-    ap.add_argument("--whisper", default="base.en", help="faster-whisper model: tiny.en, base.en, small.en")
+                    help="a Piper voice (.onnx) for English; other languages download their own voice on first use")
+    ap.add_argument("--voice-dir", type=Path, default=Path("models/piper"), help="where Piper voices are kept")
     ap.add_argument("--mic", default=None, help="microphone device number or name (default: system default)")
     ap.add_argument("--no-reflexes", action="store_true", help="only act when asked")
     ap.add_argument("--no-sim", action="store_true", help="do not open the simulated robot")
@@ -67,19 +77,20 @@ def make_voice(a, jarvis):
     if not a.voice:
         return None
     try:
-        from jarvis.voice import LocalVoice
+        from jarvis.voice import Listener, Speaker
         mic = int(a.mic) if a.mic and a.mic.isdigit() else a.mic
-        voice = LocalVoice(jarvis.hear, whisper_model=a.whisper, device=mic,
-                           voice_model=str(a.voice_model) if a.voice_model.exists() else None)
+        speaker = Speaker(a.voice_dir, fixed_voice=str(a.voice_model) if a.voice_model.exists() else None)
+        print(f"loading speech recognition (Whisper {a.whisper}) ...")
+        listener = Listener(lambda text, lang: jarvis.hear(text, lang=lang), engine=a.wake_engine,
+                            whisper_model=a.whisper, device=mic, speaking=speaker.speaking)
     except ImportError as e:
         print(f"voice off: {e}. Install it with: pip install -r requirements-jarvis.txt")
         return None
-    if voice.tts is None:
-        print(f"no Piper voice at {a.voice_model}: replies are printed only")
-    jarvis.speak_fn = voice.speak
-    jarvis.on_wake = voice.wake_up
-    voice.start()
-    return voice
+    listener.lang = jarvis.lang
+    jarvis.speak_fn = speaker.speak
+    jarvis.on_wake = listener.wake_up
+    listener.start()
+    return listener
 
 
 def run_demo_video(a, jarvis, robot, fps=30, size=(960, 540)):
@@ -115,6 +126,7 @@ def main(argv=None):
         from jarvis.robot import SimRobot
         robot = SimRobot()
     jarvis = Jarvis(brain=make_brain(a), robot=robot, reflexes=not a.no_reflexes)
+    jarvis.lang = a.lang
     if a.demo and a.video:
         run_demo_video(a, jarvis, robot)
         return

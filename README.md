@@ -79,7 +79,7 @@ connection the first time.
    | `.venv\Scripts\python -m pip install -r requirements.txt` | `.venv/bin/python -m pip install -r requirements.txt` |
 
 5. **Check it** (no camera needed, about a minute): `.venv\Scripts\python -m pytest` on Windows,
-   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `278 passed`.
+   `.venv/bin/python -m pytest` on Mac or Linux. It should end with `364 passed`.
 6. **Run it:** `.venv\Scripts\python scripts\live.py` on Windows, `.venv/bin/python scripts/live.py` on Mac or
    Linux. The first run downloads about 40 MB of models into `models/` and unpacks the object model (about a
    second). On a Mac, the first run asks for camera access: allow it for Terminal (System Settings > Privacy &
@@ -851,7 +851,8 @@ python scripts/jarvis.py --no-camera            # just the robot and your comman
 | Brain | `jarvis/brain.py` | Words to a spoken reply and actions. `OllamaBrain` runs a local language model with tool calling; `RuleBrain` understands short commands and a few questions ("what am I holding?") with no model, and takes over whenever Ollama is not running |
 | Body | `jarvis/skills.py` | Skills to joint targets for all of the robot's joints: rest or shadow mode, then held grips, then where the head looks, then the current skill, then a per-joint speed limit (shoulders 90 deg/s, fingers 300) so every start and stop is smooth |
 | Robot | `jarvis/robot.py` | The targets to the MuJoCo robot (`SimRobot`), or as 0..1 commands over USB serial to a microcontroller (`SerialRobot`, for the real arm; not tested on hardware yet) |
-| Voice | `jarvis/voice.py` | "Hey Jarvis" wake word (openWakeWord), speech to text (faster-whisper), spoken replies (Piper) |
+| Languages | `jarvis/languages.py`, `jarvis/i18n.py` | Which language you spoke (from the wake phrase), "Jarvis" in every script, "stop" in about 35 languages, command words and Jarvis's lines in 12 built-in languages |
+| Voice | `jarvis/voice.py` | Hears "Jarvis" in any language (Whisper), speech to text, spoken replies in your language (Piper) |
 
 **Actions** (what the model's tools, the rules and the reflexes can do): wave, nod, shake head, thumbs up, point
 and look (at you, your gaze target, or a direction), reach out a hand, grip (0 to 1) and release, celebrate, shrug,
@@ -872,9 +873,56 @@ round, or "no" to end with the match result. Without a camera, say your throw ("
 The robot picks its throw before the count, from a random generator that never sees yours. While a game is on,
 reflexes are paused, so your open palm is paper rather than a wave.
 
-**Talking to it.** Say "Hey Jarvis" and the command in one breath. The microphone keeps the last 1.2 seconds of
-audio from before the wake word fires, so the start of the command is not cut off, and "hey Jarvis" is removed
-from what it heard. Replies are spoken on their own thread, so the robot keeps moving while Jarvis talks.
+**Talking to it.** Say "Hey Jarvis" (or "Wake up Jarvis") and the command in one breath, or pause and then say
+the command. Nothing at the start of the command is cut off: audio from just before you started talking is kept.
+Replies are spoken on their own thread, so the robot keeps moving while Jarvis talks.
+
+**Languages.** Wake Jarvis in your language and the whole conversation switches to it: it understands you in it,
+answers in it, counts rock paper scissors in it, and speaks with a voice for it.
+
+| You say | Language |
+| --- | --- |
+| "Hey Jarvis, shadow me" / "Wake up Jarvis, wave" | English |
+| "Oye Jarvis, imítame" / "Despierta Jarvis" | Spanish |
+| "Réveille-toi Jarvis, pierre feuille ciseaux" | French |
+| "Hallo Jarvis, mach mich nach" / "Jarvis, wach auf" | German |
+| "Ehi Jarvis, saluta" | Italian |
+| "Acorda Jarvis, me imita" | Portuguese |
+| "अरे जार्विस, मेरी नकल करो" | Hindi |
+| "嘿贾维斯，石头剪刀布" | Chinese |
+| "ジャービス、起きて。じゃんけんしよう" | Japanese |
+| "자비스 일어나, 가위바위보" | Korean |
+| "Джарвис, проснись, повторяй за мной" | Russian |
+| "يا جارفيس، قلدني" | Arabic |
+
+How it works:
+- **Hearing "Jarvis" in any language.** The default wake engine runs Whisper's multilingual model on each phrase
+  you say and looks for the name at its start, in any script (Jarvis, ジャービス, 贾维斯, 자비스, Джарвис, जार्विस,
+  جارفيس...), including the near misses Whisper makes when the name is said with another language's sounds.
+  Whisper is also told to expect the word "Jarvis", which made it spell the name right far more often in
+  testing. `--wake-engine oww` uses openWakeWord instead: lighter, but its model only knows English "Hey Jarvis".
+- **Picking the language.** Wake words that belong to one language decide it ("despierta", "réveille-toi",
+  "起きて", "проснись"); for words shared between languages ("hey") Whisper's language detection on the whole
+  sentence decides; if Whisper is unsure, the last language stays. Typed commands work the same way.
+- **What works in which languages.**
+  - Built in, with no model at all (12): English, Spanish, French, German, Italian, Portuguese, Hindi, Chinese,
+    Japanese, Korean, Russian, Arabic. Their command words, rock paper scissors throws and answers, and every line
+    Jarvis says are written in; the count follows each language's own chant (最初はグー、じゃんけんぽん; 안 내면
+    진다, 가위 바위 보).
+  - With the local language model (any of Whisper's ~99 languages): the model understands the command and replies
+    in the language, and Jarvis's own lines are translated by it once and kept in `models/translations.json`.
+    Without a model, those languages get English replies.
+  - Spoken replies: every language with a Piper voice (about 50, listed in `languages.VOICES`, a male voice where
+    there is one). Each voice downloads itself into `models/piper/` the first time you speak that language.
+    Japanese and Chinese voices need one extra package (see `requirements-jarvis.txt`).
+  - "Stop": about 35 languages ("alto", "arrête", "stopp", "fermati", "रुको", "停", "止まれ", "멈춰", "стоп",
+    "توقف"...), always handled at once without any model. Stopping also ends shadow mode.
+- **Tested on real speech.** Piper's own voices spoke a wake phrase and command in 14 languages, and the actual
+  listener (Whisper `small`) chose the right language for all 14 and carried out 9 commands with no model; the
+  other 5 were a misheard word ("ciseaux") or languages that need the model (Dutch, Polish, Turkish). The `base`
+  Whisper model is faster, but on the same phrases it misspelled the name and misjudged the language far more
+  often (Hindi heard as Latin, Russian as Polish), so `small` is the default. Synthetic voices are not people;
+  check it with your own voice.
 
 **Safety.** "Stop", "freeze", "halt" or "hold still", typed, spoken, or the space bar in a window, freezes every
 joint at once. It never waits for the language model. Reflexes do nothing while it is frozen, copying you, or in
@@ -886,12 +934,11 @@ the middle of something you asked for.
    `llama3.2:3b` for a slower computer, with `--model`). A graphics card makes replies faster but is not needed.
 
 **Setting up the voice** (optional):
-1. `pip install -r requirements-jarvis.txt` (on Linux, use Python 3.11 or 3.12: the wake word library needs a
-   TensorFlow Lite package that has no Python 3.13 build there; Windows and Mac are fine)
-2. Download a voice: `python -m piper.download_voices en_GB-alan-medium` and move the two `en_GB-alan-medium`
-   files into `models/` (or pass `--voice-model path/to/voice.onnx`).
-3. `python scripts/jarvis.py --voice`, then say "Hey Jarvis" and a command. The call-me gesture (thumb and pinky
-   out) also starts listening. The first run downloads the wake word and Whisper models.
+1. `pip install -r requirements-jarvis.txt`
+2. `python scripts/jarvis.py --voice`, then say "Hey Jarvis" (in any language) and a command. The call-me
+   gesture (thumb and pinky out) also starts listening. The first run downloads Whisper `small` (about 460 MB) and
+   the English voice; other languages' voices download the first time you use them. On a slower computer use
+   `--whisper base` (weaker outside English), and `--lang es` (for example) to start in another language.
 
 **Try saying:** "Hey Jarvis, shadow me", "stop mirroring me", "rock paper scissors?", "wave with your left hand",
 "point at me", "look at that" (after locking a gaze target), "give me a thumbs up and nod", "grip gently with your
@@ -961,7 +1008,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | Folder or file | Contents |
 | --- | --- |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
-| `tests/` | 278 automated tests (see [Tests](#tests)) |
+| `tests/` | 364 automated tests (see [Tests](#tests)) |
 | `docs/` | the picture of the simulated robot |
 | `models/` | downloaded and unpacked models (created on first run; not in git) |
 | `faces/` | enrolled faces and emotion calibrations (created when you enroll; not in git) |
@@ -988,11 +1035,11 @@ publishing the repository or shipping it in a product would bring in the AGPL's 
 ## Tests
 
 ```
-python -m pytest            # all 278 tests, about a minute, no camera needed
+python -m pytest            # all 364 tests, about a minute, no camera needed
 python -m pytest -k grasp   # just one area
 ```
 
-All 278 pass on Python 3.13 (on 3.9 without MuJoCo installed, the 11 robot tests are skipped). Covered: kinematics round trips for both arms and both legs and the core
+All 364 pass on Python 3.13 (on 3.9 without MuJoCo installed, the 11 robot tests are skipped). Covered: kinematics round trips for both arms and both legs and the core
 (exact for random poses, headings and pelvic hikes), desk and standing calibration with a tilted camera, PnP hand
 position recovery, all gestures in random orientations for both hands, head pose round trips, eye angles and gaze
 points (exact for random head poses), gaze calibration that survives head motion, target locking, emotion

@@ -247,7 +247,10 @@ class Body:
         self.motion, self.queue, self.grips, self.attention = None, [], {}, None
 
     def freeze(self):
+        """Hold every joint where it is. Ends shadow mode too, so the robot does not start copying again when
+        it is unfrozen."""
         self.frozen = True
+        self.shadow = False
         self.motion, self.queue = None, []
 
     def set_shadow(self, on: bool, mirror: bool | None = None):

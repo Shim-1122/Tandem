@@ -8,16 +8,19 @@
 Your throw is read from Tandem's gestures: fist = rock, open palm (or four fingers) = paper, peace (V) =
 scissors. Hands pump as fists during the count and people throw a little late, so your hand is read 0.6 s after
 "shoot" (the latest throw shape seen by then), or up to 1.2 s after if no shape has shown yet.
-Without a camera (or if the camera misses it) you can also just say or type "rock", "paper" or "scissors" then.
+Without a camera (or if the camera misses it) you can also just say or type "rock", "paper" or "scissors" then,
+in English or in the language you are playing in ("tijera", "グー", "камень"...). Jarvis counts in that language
+too, with its own chant where it has one (じゃんけんぽん, 가위 바위 보, 石头剪刀布).
 
 Fair play: the robot picks its throw before the count starts, from a random generator that never sees yours.
 """
 from __future__ import annotations
 
 import random
-import re
 
 from . import skills
+from .i18n import tr
+from .languages import contains_any, game_words, throw_words
 
 BEAT_S = 0.6                                  # time between "rock", "paper", "scissors" and "shoot"
 WINDOW = (-0.2, 1.2)                          # when your throw counts, seconds around "shoot"
@@ -26,7 +29,6 @@ READY_TIMEOUT_S = 12.0                        # start anyway after this long wit
 AGAIN_TIMEOUT_S = 20.0                        # end the game if nobody asks for another round
 GESTURE_THROW = {"fist": "rock", "open_palm": "paper", "four": "paper", "peace": "scissors"}
 BEATS = {"rock": "scissors", "paper": "rock", "scissors": "paper"}     # each key beats its value
-WORD_THROW = {"rock": "rock", "rocks": "rock", "paper": "paper", "scissors": "scissors", "scissor": "scissors"}
 
 
 def winner(robot: str, person: str) -> str:
@@ -36,15 +38,11 @@ def winner(robot: str, person: str) -> str:
     return "robot" if BEATS[robot] == person else "person"
 
 
-READY = re.compile(r"\b(ready|go|let'?s go|start|yes|yeah|ok|okay)\b")
-AGAIN = re.compile(r"\b(again|one more|another|yes|yeah|sure|rematch|play|ok|okay)\b")
-DONE = re.compile(r"\b(no|nope|done|quit|enough|that'?s it|i'?m good)\b")
-
-
-def throw_from_words(text: str):
-    words = [w.strip(".,!?") for w in (text or "").lower().split()]
-    found = [WORD_THROW[w] for w in words if w in WORD_THROW]
-    return found[-1] if len(found) == 1 or (found and len(set(found)) == 1) else None
+def throw_from_words(text: str, lang: str = "en"):
+    """The throw named in what was said (in English or the language spoken), or None if none or several."""
+    t = (text or "").lower()
+    found = {throw for word, throw in throw_words(lang).items() if contains_any(t, [word], lang)}
+    return found.pop() if len(found) == 1 else None
 
 
 class RockPaperScissors:
@@ -64,23 +62,28 @@ class RockPaperScissors:
         self.j.body.look("person")
         self.j.say("You're on! Show me a fist when you're ready.")
 
+    def _words(self):
+        return game_words(self.j.lang)
+
     # ------------------------------------------------------------------ input
     def hear(self, text: str, now: float) -> bool:
         """Words for the game. True if the game used them (so the brain does not also answer)."""
         t = (text or "").lower()
-        if self.state == "ready" and READY.search(t):
+        lang = self.j.lang
+        ready, again, done = self._words()
+        if self.state == "ready" and contains_any(t, ready, lang):
             self._start_count(now)
             return True
         if self.state in ("count", "read"):
-            throw = throw_from_words(t)
+            throw = throw_from_words(t, lang)
             if throw:
                 self.said_throw = throw
                 return True
         if self.state == "again":
-            if DONE.search(t):
+            if contains_any(t, done, lang):
                 self.finish(now)
                 return True
-            if AGAIN.search(t):
+            if contains_any(t, again, lang):
                 self.j.say("Okay. Rock...")
                 self._start_count(now, said_first=True)
                 return True
@@ -140,25 +143,30 @@ class RockPaperScissors:
         w = winner(r, p)
         self.score[w] += 1
         self.result = (r, p, w)
-        s = self.score
-        tally = f"{s['person']} to {s['robot']}" + (f", {s['tie']} tied" if s["tie"] else "")
+        s, L = self.score, self.j.local
+        tally = L("{you} to {me}, {ties} tied" if s["tie"] else "{you} to {me}", you=s["person"], me=s["robot"],
+                  ties=s["tie"])
+        rn, pn = L(r), L(p)
+        cap = lambda x: x[:1].upper() + x[1:]                      # noqa: E731 (start of the sentence)
         if w == "robot":
-            self.j.say(f"{r.capitalize()} beats {p}. I win! That's {tally}. Again?")
+            self.j.say("{robot} beats {person}. I win! That's {tally}. Again?", robot=cap(rn), person=pn, tally=tally)
             self.j.body.do(skills.celebrate(2.0), now, queue=True)
         elif w == "person":
-            self.j.say(f"{p.capitalize()} beats {r}. You got me. That's {tally}. Again?")
+            self.j.say("{person} beats {robot}. You got me. That's {tally}. Again?", robot=rn, person=cap(pn),
+                       tally=tally)
             self.j.body.do(skills.shrug(1.5), now, queue=True)
         else:
-            self.j.say(f"We both threw {r}. Tie! That's {tally}. Again?")
+            self.j.say("We both threw {throw}. Tie! That's {tally}. Again?", throw=rn, tally=tally)
             self.j.body.do(skills.nod(1), now, queue=True)
         self.state, self.t0 = "again", now
 
     def finish(self, now: float):
         s = self.score
         if s["person"] + s["robot"] + s["tie"]:
-            verdict = ("You win the match" if s["person"] > s["robot"] else
-                       "I win the match" if s["robot"] > s["person"] else "It's a draw")
-            self.j.say(f"Good game. {verdict}, {s['person']} to {s['robot']}.")
+            line = ("Good game. You win the match, {you} to {me}." if s["person"] > s["robot"] else
+                    "Good game. I win the match, {you} to {me}." if s["robot"] > s["person"] else
+                    "Good game. It's a draw, {you} to {me}.")
+            self.j.say(line, you=s["person"], me=s["robot"])
         else:
             self.j.say("Maybe later.")
         self.j.body.rest()
