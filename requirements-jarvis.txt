@@ -1,0 +1,12 @@
+# Jarvis's voice (optional): wake word, speech to text, text to speech, all on your own computer.
+# Typed commands, reflexes and the Ollama brain need nothing beyond requirements.txt.
+faster-whisper>=1.0      # speech to text in about 99 languages, and hearing "Jarvis" in any of them
+piper-tts>=1.3           # spoken replies; each language's voice downloads itself the first time it is needed
+sounddevice>=0.4
+# Some Piper voices need one more package (install only the ones you will speak):
+#   Japanese:  pip install "piper-tts[ja]"
+#   Chinese:   pip install "piper-tts[zh]"     (large: it brings in transformers)
+#   Thai:      pip install "piper-tts[th]"
+# openwakeword>=0.6      # only for --wake-engine oww (English "Hey Jarvis", lighter on the processor; on Linux
+#                        # it needs Python 3.11 or 3.12)
+# pyserial>=3.5          # only for jarvis.robot.SerialRobot (a microcontroller driving the real arm)
