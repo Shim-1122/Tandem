@@ -43,6 +43,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
+from . import native as _native
 from .geometry import cross3, L_HIP, L_SHOULDER, R_HIP, R_SHOULDER, unit
 from .kinematics import rot_x, rot_y, rot_z, thorax_frame
 
@@ -98,8 +99,11 @@ class CoreAngles:
     core_rotation: float = np.nan
 
 
-def core_angles(pose: np.ndarray, up: np.ndarray = CAMERA_UP) -> CoreAngles:
+def core_angles(pose: np.ndarray, up: np.ndarray = CAMERA_UP, native: bool | None = None) -> CoreAngles:
     """Chest (shoulder line and trunk axis) relative to the pelvis."""
+    if _native.use(native):
+        return CoreAngles(*_native.core.core_angles(np.ascontiguousarray(pose, dtype=float),
+                                                    np.ascontiguousarray(up, dtype=float)))
     R_p = pelvis_frame(pose, up)[0]
     R_t = thorax_frame(pose)[0]                        # up from the hips to the shoulders
     z, x, y = euler_zxy(R_p.T @ R_t)
@@ -109,10 +113,12 @@ def core_angles(pose: np.ndarray, up: np.ndarray = CAMERA_UP) -> CoreAngles:
 class LegKinematics:
     """Stateful solver for one leg. Call `solve` once per frame, in time order."""
 
-    def __init__(self, side: str = "right", min_knee_deg: float = 20.0, pole_deg: float = 5.0):
+    def __init__(self, side: str = "right", min_knee_deg: float = 20.0, pole_deg: float = 5.0,
+                 native: bool | None = None):
         if side not in LEG:
             raise ValueError("side must be 'left' or 'right'")
         self.side, self.min_knee, self.pole = side, min_knee_deg, pole_deg
+        self._core = _native.core.LegSolver(side, min_knee_deg, pole_deg) if _native.use(native) else None
         self.mirror = np.array([1.0, 1.0, -1.0 if side == "left" else 1.0])
         self.foot_correction = np.eye(3)      # landmark foot frame -> anatomical foot frame (see calibrate)
         self._tau = 0.0                       # last hip rotation, radians
@@ -120,6 +126,8 @@ class LegKinematics:
 
     def reset(self):
         self._tau = self._phi = 0.0
+        if self._core is not None:
+            self._core.reset()
 
     def _local(self, pose, up):
         R_p, origin, _ = pelvis_frame(pose, up)
@@ -138,6 +146,11 @@ class LegKinematics:
 
     def solve(self, pose: np.ndarray, up: np.ndarray = CAMERA_UP, foot: bool = True) -> LegAngles:
         """pose: (33, 3) world landmarks; up: up direction in the same axes; foot: heel and toe in view."""
+        if self._core is not None:
+            vals, source, valid = self._core.solve(np.ascontiguousarray(pose, dtype=float),
+                                                   np.ascontiguousarray(up, dtype=float), bool(foot),
+                                                   np.ascontiguousarray(self.foot_correction, dtype=float))
+            return LegAngles(*vals, hip_rotation_source=("held", "knee", "foot")[source], ankle_valid=valid)
         (H, K, A, Hl, T), U = self._local(pose, up)
         out = LegAngles(pelvic_hike=float(np.degrees(np.arcsin(np.clip(U[2], -1.0, 1.0)))))
         yt, sd = unit(H - K), unit(A - K)

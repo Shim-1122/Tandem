@@ -1,0 +1,20 @@
+[package]
+name = "tandem_core"
+version = "0.1.0"
+edition = "2021"
+description = "Tandem's per-frame math in Rust: One Euro filters and the hand, arm, leg and core solvers"
+license = "MIT"
+publish = false
+
+[lib]
+name = "tandem_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py310"] }
+numpy = "0.23"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

@@ -100,6 +100,12 @@ def parse_args(argv=None) -> Config:
                     help="instances of the body model on alternate frames (0 = automatic)")
     ap.add_argument("--display-hz", type=float, default=60.0,
                     help="redraw the window at most this often; tracking and recording always run at full rate")
+    ap.add_argument("--ros2", action="store_true",
+                    help="publish the tracking as ROS 2 topics (/tandem/joint_states, /tandem/face/blendshapes, "
+                         "/tandem/face/servos, /tandem/emotion); run where ROS 2 is sourced")
+    ap.add_argument("--sync-display", action="store_true",
+                    help="use results in the window's loop, once per camera frame (the old way); by default they are "
+                         "used on their own thread the moment they are ready")
     ap.add_argument("--gpu", action="store_true",
                     help="run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU)")
     ap.add_argument("--sim", nargs="?", const="robot", choices=["robot", "human"], default=None,
@@ -149,7 +155,7 @@ def parse_args(argv=None) -> Config:
                   emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell, objects=not a.no_objects,
                   object_model=a.object_model, max_grip_n=a.max_grip_n,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
-                  record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz,
+                  record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz, display_thread=not a.sync_display, ros2=a.ros2,
                   gpu=a.gpu, sim=a.sim or False, sim_camera=a.sim_camera, sim_mode=a.sim_mode,
                   sim_mirror=not a.no_mirror, face_source=a.face_source, emotion_gain=a.emotion_gain,
                   face_rig=a.face_rig)

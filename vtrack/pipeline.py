@@ -233,9 +233,10 @@ class ModelWorker(threading.Thread):
 
     def __init__(self, name: str, camera: CameraReader, fn, max_hz: float | None = None,
                  gate: BackgroundGate | None = None, min_hz: float = 5.0, claim: "FrameClaim | None" = None,
-                 meter: RateMeter | None = None):
+                 meter: RateMeter | None = None, notify: threading.Event | None = None):
         super().__init__(daemon=True, name=name)
         self.camera, self.fn, self.max_hz = camera, fn, max_hz
+        self.notify = notify          # set the moment a result is ready, so it can be used at once
         self.gate, self.min_hz, self.claim = gate, min_hz, claim
         self.latest: Result | None = None
         self.meter = meter or RateMeter()
@@ -276,6 +277,8 @@ class ModelWorker(threading.Thread):
             self.error = None                              # recovered (for example after a failed download)
             with self._lock:
                 self.latest = Result(value, frame.index, frame.t, done)
+            if self.notify is not None:
+                self.notify.set()
             self.meter.add(done, done - frame.t)
             if self.max_hz:
                 rest = 1.0 / self.max_hz - (time.monotonic() - t0)

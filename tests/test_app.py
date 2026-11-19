@@ -465,3 +465,25 @@ def test_several_hand_instances_feed_every_result_in_order(tmp_path):
     assert len(renders) / seconds < 12                              # drawn at about 10 Hz
     assert len(rows) / seconds > 5 * len(renders) / seconds         # recorded far faster than drawn
     assert hand_rate[0] > 90                                           # 3 x (1 / 20 ms) = 150 at best
+
+
+@pytest.mark.parametrize("threaded", [True, False])
+def test_results_are_used_as_soon_as_they_are_ready(tmp_path, threaded):
+    """On the tracking thread, a result never waits for the next camera frame or for the window to be drawn."""
+    rec = tmp_path / "wait.csv"
+    app = App(Config(side="right", cores=8, display_hz=30, display_thread=threaded, record=rec), FakeCap(fps=30),
+              fake_models())
+    t0 = time.monotonic()
+
+    def slow_show(img):
+        time.sleep(0.02)                                   # a slow window
+
+    app.run(show=slow_show, waitkey=lambda: ord("q") if time.monotonic() - t0 > 2.0 else 255)
+    wait = np.array(app.result_wait)
+    rows = list(csv.reader(open(rec, encoding="utf-8")))[1:]
+    ts = [float(r[0]) for r in rows]
+    assert len(wait) > 40 and all(b >= a for a, b in zip(ts, ts[1:]))   # every result recorded, in capture order
+    if threaded:
+        assert np.percentile(wait, 95) < 0.012              # used within milliseconds
+    else:
+        assert np.percentile(wait, 95) > 0.012              # the one loop makes results wait for frames and redraws

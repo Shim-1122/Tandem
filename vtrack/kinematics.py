@@ -45,6 +45,7 @@ from dataclasses import dataclass, fields
 
 import numpy as np
 
+from . import native as _native
 from .geometry import (L_ELBOW, cross3, L_HIP, L_SHOULDER, L_WRIST, R_ELBOW, R_HIP, R_SHOULDER, R_WRIST, unit)
 
 # Pose landmark indices for the hand points MediaPipe pose provides (pinky, index) per side
@@ -116,15 +117,19 @@ class ArmAngles:
 class ArmKinematics:
     """Stateful solver for one arm. Call `solve` once per frame, in time order."""
 
-    def __init__(self, side: str = "right", min_elbow_deg: float = 20.0, pole_deg: float = 5.0):
+    def __init__(self, side: str = "right", min_elbow_deg: float = 20.0, pole_deg: float = 5.0,
+                 native: bool | None = None):
         if side not in _SIDE:
             raise ValueError("side must be 'left' or 'right'")
         self.side, self.min_elbow, self.pole = side, min_elbow_deg, pole_deg
+        self._core = _native.core.ArmSolver(side, min_elbow_deg, pole_deg) if _native.use(native) else None
         self._tau = 0.0       # last valid shoulder rotation, radians
         self._phi = 0.0       # last valid shoulder flexion, radians
 
     def reset(self):
         self._tau = self._phi = 0.0
+        if self._core is not None:
+            self._core.reset()
 
     def _to_thorax(self, v: np.ndarray, R_t: np.ndarray) -> np.ndarray:
         c = R_t.T @ v
@@ -140,6 +145,12 @@ class ArmKinematics:
         which is noisier. Hand landmarks and pose landmarks are assumed to share axis directions
         (both aligned with the camera); check this on real data with `frame_agreement_deg`.
         """
+        if self._core is not None:
+            vals, rot_ok, wrist_ok = self._core.solve(
+                np.ascontiguousarray(pose, dtype=float),
+                None if hand is None else np.ascontiguousarray(hand, dtype=float),
+                None if up_hint is None else np.ascontiguousarray(up_hint, dtype=float))
+            return ArmAngles(*vals, shoulder_rotation_valid=rot_ok, wrist_valid=wrist_ok)
         R_t, origin = thorax_frame(pose, up_hint)
         s_i, e_i, w_i = _SIDE[self.side]
         S, E, W = (self._to_thorax(pose[i] - origin, R_t) for i in (s_i, e_i, w_i))
