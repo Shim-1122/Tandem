@@ -5,8 +5,9 @@ What it adds to the robot model in sim.py (which stays the hardware plan for Hom
   * legs: hip flexion, abduction and rotation, knee, ankle dorsiflexion, inversion and abduction per leg, and the
     pelvis tilting side to side (pelvic hike), all with the tracker's names and signs
   * the whole core: flexion, side bend and rotation (the robot only builds rotation)
-  * a face: jaw, lips, mouth corners, cheeks, nose, brows, upper and lower eyelids and eyes, driven by MediaPipe's
-    52 face blendshapes and the emotion model's scores (see face_rig.py)
+  * a face built like an animatronic head (animatronic.py): the ICT face (an open, sculpted human face) as the
+    skin over a jaw hinge, eyes on joints and the skin servos of Will Cogley's DIY robot head, driven by
+    MediaPipe's 52 face blendshapes and the emotion model's scores (face_rig.py)
 
 The arms and hands are built by the same code as the robot (sim._arm), so their joints match the tracker exactly.
 
@@ -28,8 +29,7 @@ import time
 
 import numpy as np
 
-from . import face_rig
-from .face_rig import FACE_JOINTS, LID_CLOSED
+from . import animatronic, face_rig
 from .filters import OneEuroFilter
 from .sim import (DRIVES, EYE_RANGES, HEAD_RANGES, SIDES, Drive, _arm, _capsule, _f, _look_camera, _Mjcf, _num,
                   _Side, source_column)
@@ -42,9 +42,8 @@ SHOULDER_HALF = 0.19                 # the tracker measures it: chest relative t
 NECK_BASE, NECK = 0.035, 0.065
 FOOT_BACK, FOOT_FRONT, FOOT_HALF_W = 0.06, 0.19, 0.045
 
-SKIN, SKIN_DARK = "0.86 0.70 0.58 1", "0.78 0.60 0.50 1"
-SHIRT, PANTS, SHOE, HAIR = "0.20 0.36 0.55 1", "0.18 0.19 0.24 1", "0.12 0.12 0.13 1", "0.16 0.11 0.08 1"
-LIP, BROW, WHITE, IRIS, PUPIL = "0.66 0.34 0.34 1", "0.18 0.12 0.09 1", "0.97 0.97 0.96 1", "0.30 0.19 0.10 1", "0.03 0.03 0.04 1"
+SKIN = animatronic.SKIN
+SHIRT, PANTS, SHOE = "0.20 0.36 0.55 1", "0.18 0.19 0.24 1", "0.12 0.12 0.13 1"
 HUMAN_LOOK = {"finger": SKIN, "palm": SKIN, "upper": SHIRT, "fore": SKIN, "shoulder": SHIRT, "joint": SKIN}
 
 LEG_RANGES = {"hip_flexion": (-30, 130), "hip_abduction": (-35, 60), "hip_rotation": (-50, 50),
@@ -64,11 +63,12 @@ HUMAN_DRIVES = {**DRIVES,
                 "hip": Drive(3000.0, 400.0, 60.0, 0.05, "body"),
                 "knee": Drive(2000.0, 300.0, 35.0, 0.03, "body"),
                 "ankle": Drive(600.0, 120.0, 8.0, 0.01, "body"),
-                "face": Drive(3.0, 0.5, 0.03, 0.0001, "face"),          # hinge: N m per radian
-                "face_slide": Drive(3000.0, 30.0, 25.0, 0.001, "face")}  # slide: N per meter
+                "jaw": Drive(60.0, 2.0, 6.0, 0.0005, "face"),           # hinge: N m per radian
+                "jaw_slide": Drive(20000.0, 200.0, 60.0, 0.01, "face"),  # slide: N per meter
+                "face_slide": Drive(400.0, 4.0, 4.0, 0.0005, "face")}    # a servo pulling a wire: N per meter
 MIDLINE_FLIP = ["core_lateral_bend", "core_rotation", "neck_yaw", "neck_roll", "eye_yaw", "head_yaw", "head_roll"]
 COUPLED_EYES = {"L_eye_yaw": "R_eye_yaw", "L_eye_pitch": "R_eye_pitch"}
-VIEWS = ["split", "front", "face", "side", "three_quarter"]
+VIEWS = ["split", "front", "face", "animatronic", "side", "three_quarter"]
 
 
 class _HumanMjcf(_Mjcf):
@@ -115,12 +115,6 @@ def _geom(m, kind, pos, size, rgba, extra=""):
     m.add(f'<geom type="{kind}" pos="{_f(pos)}" size="{_f(size)}" rgba="{rgba}" class="robot" {extra}/>')
 
 
-def _face_part(m, kind, pos, size, rgba, extra=""):
-    """A light, collision-free face geom."""
-    m.add(f'<geom type="{kind}" pos="{_f(pos)}" size="{_f(size)}" rgba="{rgba}" contype="0" conaffinity="0" '
-          f'density="300" {extra}/>')
-
-
 def _leg(m: _HumanMjcf, side: str):
     s = _Side(side)
     p = s.p
@@ -149,127 +143,25 @@ def _leg(m: _HumanMjcf, side: str):
         m.close("body")
 
 
-def _face_x(y, z, out=0.002):
-    """x of the face surface (the cranium and midface ellipsoids) at (y, z) in the head frame, plus `out`."""
-    best = -1.0
-    for (cx, cy, cz), (a, b, c) in (((-0.01, 0, 0.125), (0.092, 0.077, 0.105)), ((0.025, 0, 0.078), (0.060, 0.066, 0.036))):
-        r = 1 - ((y - cy) / b) ** 2 - ((z - cz) / c) ** 2
-        if r > 0:
-            best = max(best, cx + a * math.sqrt(r))
-    return best + out
-
-
-def _side_slide(m, s: _Side, name, axis, rng):
-    """A slide joint on one side; `axis` is for the right side (vectors mirror like positions)."""
-    m.slide(name, s.pos(axis), rng)
-
-
-def _head(m: _HumanMjcf):
+def _head(m: _HumanMjcf, face: animatronic.Face):
     m.open(f'<body name="neck" pos="0 0 {CHEST_H + NECK_BASE}">')
     m.joint("neck_yaw", [0, 0, 1], HEAD_RANGES["neck_yaw"], "neck")
     m.joint("neck_pitch", [0, -1, 0], HEAD_RANGES["neck_pitch"], "neck")
     m.joint("neck_roll", [1, 0, 0], HEAD_RANGES["neck_roll"], "neck")
-    _capsule(m, [0, 0, -0.04], [0.01, 0, NECK], 0.052, SKIN)
+    # the neck's mass and collision shape; the skin is the face model's
+    m.add(f'<geom type="capsule" fromto="0 0 -0.03 0.005 0 {NECK}" size="0.045" group="{animatronic.HIDDEN_GROUP}" '
+          'class="robot"/>')
     m.open(f'<body name="head" pos="0 0 {NECK}">')
-    # skull, hair, midface (cheekbones and upper lip), nose, ears, brow ridge
-    _geom(m, "ellipsoid", [-0.01, 0, 0.125], [0.092, 0.077, 0.105], SKIN, 'density="900"')
-    _geom(m, "ellipsoid", [-0.022, 0, 0.152], [0.093, 0.081, 0.094], HAIR, 'density="100"')
-    _face_part(m, "ellipsoid", [0.025, 0, 0.078], [0.060, 0.066, 0.036], SKIN)
-    _face_part(m, "ellipsoid", [0.086, 0, 0.091], [0.011, 0.009, 0.023], SKIN)
-    _face_part(m, "sphere", [0.094, 0, 0.074], [0.0095], SKIN)
-    for y in (-0.077, 0.077):
-        _face_part(m, "ellipsoid", [-0.012, y, 0.11], [0.013, 0.007, 0.028], SKIN_DARK)
-    for sgn in (-1, 1):
-        m.add(f'<geom type="capsule" fromto="0.074 0 0.130 0.060 {sgn * 0.056} 0.128" size="0.011" '
-              f'rgba="{SKIN}" contype="0" conaffinity="0" density="300"/>')
-    # inside of the mouth and the teeth (seen when the lips part)
-    _face_part(m, "ellipsoid", [0.058, 0, 0.044], [0.016, 0.022, 0.011], "0.32 0.08 0.09 1")
-    _face_part(m, "box", [0.071, 0, 0.049], [0.004, 0.017, 0.0035], WHITE)
-    m.add('<camera name="eyes" pos="0.1 0 0.11" xyaxes="0 -1 0 0 0 1" fovy="70"/>')
-    for side in ("right", "left"):
-        s = _Side(side)
-        p = s.p
-        eye = s.pos([0.068, -0.032, 0.110])
-        m.open(f'<body name="{p}eye" pos="{_f(eye)}">')
-        m.joint(f"{p}eye_yaw", [0, 0, 1], EYE_RANGES["eye_yaw"], "eye")
-        m.joint(f"{p}eye_pitch", [0, -1, 0], EYE_RANGES["eye_pitch"], "eye")
-        _face_part(m, "sphere", [0, 0, 0], [0.0125], WHITE)
-        _face_part(m, "sphere", [0.0085, 0, 0], [0.0055], IRIS)
-        _face_part(m, "sphere", [0.0118, 0, 0], [0.0025], PUPIL)
-        m.close("body")
-        m.open(f'<body name="{p}eyelid_body" pos="{_f(eye)}">')
-        m.joint(f"{p}eyelid", [0, 1, 0], FACE_JOINTS[p + "eyelid"][1:3], "face")
-        _face_part(m, "ellipsoid", [0, 0, 0.0128], [0.0148, 0.0165, 0.0035], SKIN_DARK)
-        m.add(f'<geom type="capsule" fromto="0.0145 -0.0135 0.0127 0.0145 0.0135 0.0127" size="0.0011" '
-              f'rgba="{BROW}" contype="0" conaffinity="0" density="300"/>')
-        m.close("body")
-        m.open(f'<body name="{p}lower_lid_body" pos="{_f(eye)}">')
-        m.joint(f"{p}lower_lid", [0, -1, 0], FACE_JOINTS[p + "lower_lid"][1:3], "face")
-        _face_part(m, "ellipsoid", [0, 0, -0.0127], [0.0140, 0.0155, 0.0024], SKIN)
-        m.close("body")
-        # brow: three points that slide up and down, drawn as a tendon through them
-        for part, y, z in (("inner", -0.014, 0.131), ("mid", -0.034, 0.138), ("outer", -0.054, 0.134)):
-            x = 0.074 - 0.014 * (abs(y) / 0.056) + 0.0125
-            m.open(f'<body name="{p}brow_{part}_body" pos="{_f(s.pos([x, y, z]))}">')
-            _side_slide(m, s, f"{p}brow_{part}", [0, 0, 1], FACE_JOINTS[f"{p}brow_{part}"][1:3])
-            m.add(f'<site name="{p}brow_{part}" size="0.002"/>')
-            m.close("body")
-        # cheek and nostril wing
-        m.open(f'<body name="{p}cheek" pos="{_f(s.pos([0.046, -0.043, 0.078]))}">')
-        _side_slide(m, s, f"{p}cheek_raise", [0, 0, 1], FACE_JOINTS[p + "cheek_raise"][1:3])
-        _side_slide(m, s, f"{p}cheek_puff", [0.3, -1, 0], FACE_JOINTS[p + "cheek_puff"][1:3])
-        _face_part(m, "ellipsoid", [0, 0, 0], [0.020, 0.017, 0.015], SKIN)
-        m.close("body")
-        m.open(f'<body name="{p}nostril" pos="{_f(s.pos([0.084, -0.0105, 0.072]))}">')
-        _side_slide(m, s, f"{p}nose_sneer", [0, 0, 1], FACE_JOINTS[p + "nose_sneer"][1:3])
-        _face_part(m, "ellipsoid", [0, 0, 0], [0.0075, 0.006, 0.005], SKIN)
-        m.close("body")
-        # mouth corner
-        m.open(f'<body name="{p}mouth_corner" pos="{_f(s.pos([_face_x(0.025, 0.047, 0.0), -0.025, 0.047]))}">')
-        _side_slide(m, s, f"{p}mouth_corner_up", [0, 0, 1], FACE_JOINTS[p + "mouth_corner_up"][1:3])
-        _side_slide(m, s, f"{p}mouth_corner_out", [-0.2, -1, 0], FACE_JOINTS[p + "mouth_corner_out"][1:3])
-        m.add(f'<site name="{p}mouth_corner" size="0.002"/>')
-        m.close("body")
-    # upper lip: raises and pushes forward; the filler between the nose and the lip moves with it
-    m.open('<body name="upper_lip" pos="0.088 0 0.050">')
-    m.slide("upper_lip_up", [0, 0, 1], FACE_JOINTS["upper_lip_up"][1:3])
-    m.slide("upper_lip_forward", [1, 0, 0], FACE_JOINTS["upper_lip_forward"][1:3])
-    _face_part(m, "ellipsoid", [-0.011, 0, 0.007], [0.012, 0.025, 0.009], SKIN)
-    for name, y in (("upper_lip_c", 0.0), ("upper_lip_r", -0.013), ("upper_lip_l", 0.013)):
-        m.add(f'<site name="{name}" pos="{_f([-0.0015 * (abs(y) / 0.013) ** 2, y, 0.0015 * (1 - abs(y) / 0.013)])}" '
-              f'size="0.002"/>')
-    m.close("body")
-    # jaw: chin, lower teeth and the lower lip
-    m.open('<body name="jaw" pos="-0.005 0 0.074">')
-    m.joint("jaw_open", [0, 1, 0], FACE_JOINTS["jaw_open"][1:3], "face")
-    m.slide("jaw_side", [0, 1, 0], FACE_JOINTS["jaw_side"][1:3])
-    _face_part(m, "ellipsoid", [0.027, 0, -0.040], [0.058, 0.051, 0.040], SKIN)
-    _face_part(m, "ellipsoid", [0.064, 0, -0.056], [0.017, 0.023, 0.015], SKIN)                     # chin
-    _face_part(m, "box", [0.075, 0, -0.030], [0.004, 0.016, 0.0035], WHITE)
-    m.open('<body name="lower_lip" pos="0.088 0 -0.0275">')
-    m.slide("lower_lip_down", [0, 0, -1], FACE_JOINTS["lower_lip_down"][1:3])
-    m.slide("lower_lip_forward", [1, 0, 0], FACE_JOINTS["lower_lip_forward"][1:3])
-    for name, y in (("lower_lip_c", 0.0), ("lower_lip_r", -0.013), ("lower_lip_l", 0.013)):
-        m.add(f'<site name="{name}" pos="{_f([-0.002 * (abs(y) / 0.013) ** 2, y, -0.002 * (1 - abs(y) / 0.013)])}" '
-              f'size="0.002"/>')
-    m.close("body")
-    m.close("body")
+    face.bodies(m, EYE_RANGES)
     m.close("body")       # head
     m.close("body")       # neck
 
 
-TENDONS = {
-    "upper_lip": (["R_mouth_corner", "upper_lip_r", "upper_lip_c", "upper_lip_l", "L_mouth_corner"], LIP, 0.0034),
-    "lower_lip": (["R_mouth_corner", "lower_lip_r", "lower_lip_c", "lower_lip_l", "L_mouth_corner"], LIP, 0.0042),
-    "R_brow": (["R_brow_inner", "R_brow_mid", "R_brow_outer"], BROW, 0.0032),
-    "L_brow": (["L_brow_inner", "L_brow_mid", "L_brow_outer"], BROW, 0.0032),
-}
-
-
-def build(floating: bool = True, scene: bool = True) -> tuple[str, _HumanMjcf]:
+def build(floating: bool = True, scene: bool = True, rig: str = "cogley") -> tuple[str, _HumanMjcf]:
     """(MJCF text, builder) of the human. `floating`: the body can move up and down (kinematic mode puts it on
     the floor); otherwise the pelvis is fixed in place."""
     m = _HumanMjcf()
+    m.face = face = animatronic.Face(head_to_chest=CHEST_H + NECK_BASE + NECK, rig=rig)
     m.add('<mujoco model="tandem_human">')
     m.depth = 1
     # face points that carry only a site (brows, mouth corners) still need a little mass to move
@@ -289,6 +181,7 @@ def build(floating: bool = True, scene: bool = True) -> tuple[str, _HumanMjcf]:
     m.add('<texture name="grid" type="2d" builtin="checker" rgb1="0.32 0.34 0.38" rgb2="0.26 0.28 0.31" '
           'width="512" height="512"/>')
     m.add('<material name="floor" texture="grid" texrepeat="8 8" reflectance="0.1"/>')
+    face.materials(m)
     m.add(f'<mesh name="torso" vertex="{_f(_hull(TORSO_SECTIONS))}"/>')
     m.add(f'<mesh name="hips" vertex="{_f(_hull(PELVIS_SECTIONS))}"/>')
     m.close("asset")
@@ -296,6 +189,9 @@ def build(floating: bool = True, scene: bool = True) -> tuple[str, _HumanMjcf]:
     # no cast shadows: at face scale MuJoCo's shadow map aliases into jagged patches
     m.add('<light pos="2 -1.5 3.5" dir="-0.5 0.3 -1" directional="true" diffuse="0.7 0.7 0.7" castshadow="false"/>')
     m.add('<light pos="2 1.5 2" dir="-0.6 -0.4 -0.3" directional="true" diffuse="0.25 0.25 0.28" castshadow="false"/>')
+    # a soft fill from the front and a little below, as in portrait lighting, so the eye sockets are not black
+    m.add('<light pos="3 0 1.2" dir="-1 0 0.25" directional="true" diffuse="0.32 0.30 0.29" specular="0 0 0" '
+          'castshadow="false"/>')
     if scene:
         m.add('<geom name="floor" type="plane" size="4 4 0.1" material="floor"/>')
     look = [0.0, 0.0, 1.0]
@@ -315,19 +211,16 @@ def build(floating: bool = True, scene: bool = True) -> tuple[str, _HumanMjcf]:
     m.add(f'<geom type="mesh" mesh="torso" rgba="{SHIRT}" class="robot"/>')
     _capsule(m, [0, -SHOULDER_HALF + 0.03, CHEST_H - 0.012], [0, SHOULDER_HALF - 0.03, CHEST_H - 0.012], 0.05, SHIRT)
     # a camera on the chest that keeps the face in view as the body bends: the close-up of the expressions
-    m.add(_look_camera("face", [0.62, 0.0, CHEST_H + 0.22], [0.0, 0.0, CHEST_H + NECK_BASE + NECK + 0.10], 30))
+    m.add(_look_camera("face", [0.62, 0.0, CHEST_H + 0.21], [0.0, 0.0, CHEST_H + NECK_BASE + NECK + 0.105], 25))
     for side in ("right", "left"):
         _arm(m, side, origin=[0, -SHOULDER_HALF, CHEST_H], look=HUMAN_LOOK)
-    _head(m)
+    _head(m, face)
     m.close("body")       # chest
     m.close("body")       # pelvis
     m.close("worldbody")
+    face.deformable(m, jaw_bind=face.jaw["pivot"])
     m.open("<tendon>")
-    for name, (sites, rgba, width) in TENDONS.items():
-        m.open(f'<spatial name="{name}" width="{width}" rgba="{rgba}" limited="false">')
-        for st in sites:
-            m.add(f'<site site="{st}"/>')
-        m.close("spatial")
+    face.tendons(m)
     m.close("tendon")
     m.open("<equality>")
     for follower, leader in COUPLED_EYES.items():
@@ -347,8 +240,8 @@ def build(floating: bool = True, scene: bool = True) -> tuple[str, _HumanMjcf]:
     return "\n".join(m.lines) + "\n", m
 
 
-def build_xml(floating: bool = True, scene: bool = True) -> str:
-    return build(floating, scene)[0]
+def build_xml(floating: bool = True, scene: bool = True, rig: str = "cogley") -> str:
+    return build(floating, scene, rig)[0]
 
 
 # ----------------------------------------------------------------------------------------------------- values
@@ -370,18 +263,18 @@ def mirror_values(values: dict) -> dict:
     return out
 
 
-def body_targets(values: dict, joints, hand_side: str = "right") -> dict:
+def body_targets(values: dict, joints, hand_side: str = "right", skip=()) -> dict:
     """Tracked body angles (degrees) by joint name, for the joints the values cover (NaN entries are skipped)."""
     cols = set(values)
     out = {}
     for j in joints:
-        if j in COUPLED_EYES or j in FACE_JOINTS or j == "root_z":
+        if j in COUPLED_EYES or j in skip or j == "root_z":
             continue
         if j == "pelvis_roll":
             r, lft = _num(values.get("R_pelvic_hike")), _num(values.get("L_pelvic_hike"))
             v = r if math.isfinite(r) else -lft
         else:
-            col = source_column(j, cols, hand_side) if not j.endswith("eyelid") else None
+            col = source_column(j, cols, hand_side)
             v = _num(values.get(col)) if col else math.nan
         if math.isfinite(v):
             out[j] = v
@@ -395,24 +288,28 @@ class HumanSim:
     VIEWS = VIEWS
 
     def __init__(self, mode: str = "kinematic", scene: bool = True, hand_side: str = "right", mirror: bool = True,
-                 face_source: str = "auto", emotion_gain: float = 1.25, smooth_face: bool = True):
+                 face_source: str = "auto", emotion_gain: float = 1.25, smooth_face: bool = True,
+                 rig: str = "cogley"):
         import mujoco
         if mode not in ("kinematic", "physics"):
             raise ValueError("mode must be 'kinematic' or 'physics'")
         self.mj, self.mode, self.mirror = mujoco, mode, mirror
         self.hand_side, self.face_source, self.emotion_gain = hand_side, face_source, emotion_gain
-        self.xml, b = build(floating=mode == "kinematic", scene=scene)
+        self.xml, b = build(floating=mode == "kinematic", scene=scene, rig=rig)
         self.kind = b.kind
         self.model = mujoco.MjModel.from_xml_string(self.xml)
         self.data = mujoco.MjData(self.model)
+        self.face = b.face
+        self.face.attach(self.model)
+        self.face_channels = set(self.face.channels)
         self.joints = [n for n, _, _ in b.joints]
         self._qadr = {self.model.joint(i).name: int(self.model.jnt_qposadr[i]) for i in range(self.model.njnt)}
         self._act = {self.model.actuator(i).name: i for i in range(self.model.nu)}
         self._soles = [self.model.site(f"{p}sole{i}").id for p in SIDES.values() for i in range(4)]
-        self.targets_si = {j: self._si(j, v) for j, v in face_rig.rest_pose().items()}   # radians or meters
+        self.targets_si = {j: 0.0 for j in self.face.channels}  # radians or meters; 0 is the neutral face
         self._bs = None                   # last blendshapes the face used
+        self.servos = {}                  # last servo values, -1..1
         self._face_filter = OneEuroFilter(min_cutoff=2.5, beta=0.8) if smooth_face else None
-        self._face_keys = sorted(FACE_JOINTS)
         self._renderer = None
         self.last_update_ms = 0.0
         self._apply()
@@ -421,21 +318,34 @@ class HumanSim:
     def _si(self, joint, v):
         return math.radians(v) if self.kind.get(joint) == "hinge" else float(v)
 
-    def face_targets(self, values: dict) -> dict:
-        """Face joint targets (degrees or meters) from blendshapes and emotions; the last face holds when both
-        are missing."""
+    def _servo_targets(self, servos: dict) -> dict:
+        out = {}
+        for n, a in servos.items():
+            x = self.face.target(n, a)
+            out[n] = math.degrees(x) if self.kind.get(n) == "hinge" else x
+        return out
+
+    def face_targets(self, values: dict, eyes=(0.0, 0.0)) -> dict:
+        """Servo targets (the jaw hinge in degrees, the skin servos in meters of anchor travel) from blendshapes and
+        emotions, with the lids following the eyes (yaw, pitch in degrees); the last face holds when both are
+        missing."""
         bs = face_rig.combine(face_rig.blendshapes_from_values(values), face_rig.emotions_from_values(values),
                               self.face_source, self.emotion_gain)
         if bs is None:
             return {}
         self._bs = bs
-        pose = face_rig.face_pose(bs)
+        servos = self.face.servo_values(bs, *eyes)
         if self._face_filter is not None:
             t = _num(values.get("t"))
             t = t if math.isfinite(t) else time.monotonic()
-            vec = self._face_filter(np.array([pose[k] for k in self._face_keys]), t)
-            pose = dict(zip(self._face_keys, (float(x) for x in vec)))
-        return pose
+            vec = self._face_filter(np.array([servos[k] for k in self.face.channels]), t)
+            servos = dict(zip(self.face.channels, (float(x) for x in vec)))
+        self.servos = servos
+        return self._servo_targets(servos)
+
+    def servo_commands(self) -> dict:
+        """The face's last servo positions (-1..1, the jaw 0..1), by Will Cogley's channel names on the cogley rig."""
+        return self.face.commands(self.servos) if self.face.rig == "cogley" else dict(self.servos)
 
     def command(self, values: dict) -> dict:
         """Take new tracker values (degrees; missing or NaN values hold the last pose). Kinematic mode sets the
@@ -444,16 +354,20 @@ class HumanSim:
         v = mirror_values(values) if self.mirror else values
         # one-arm recordings have no L_/R_ prefix: in mirror mode they drive the other arm
         side = {"right": "left", "left": "right"}[self.hand_side] if self.mirror else self.hand_side
-        changed = body_targets(v, self.joints, side)
+        changed = body_targets(v, self.joints, side, self.face_channels)
         if not any(math.isfinite(_num(v.get(e))) for e in ("eye_yaw", "eye_pitch")):
             bs = face_rig.blendshapes_from_values(v)
             if bs is not None:
                 changed["R_eye_yaw"], changed["R_eye_pitch"] = face_rig.gaze_from_blendshapes(bs)
-        changed.update(self.face_targets(v))
+        eyes = tuple(changed.get(k, math.degrees(self.targets_si.get(k, 0.0))) for k in ("R_eye_yaw", "R_eye_pitch"))
+        changed.update(self.face_targets(v, eyes))
         if "eyes_open" in v and face_rig.blendshapes_from_values(v) is None and self.face_source != "emotion":
             o = _num(v["eyes_open"])                 # no blendshapes: blink from the tracker's eyes_open
             if math.isfinite(o) and o < 0.5:
-                changed["R_eyelid"] = changed["L_eyelid"] = LID_CLOSED
+                bs = {"eyeBlinkLeft": 1.0, "eyeBlinkRight": 1.0}
+                shut = self.face.servo_values(bs)
+                lids = [n for n in shut if "lid" in n or n.startswith("eyeBlink")]
+                changed.update(self._servo_targets({n: shut[n] for n in lids}))
         for j, x in changed.items():
             if j in self._qadr:
                 lo, hi = self.model.jnt_range[self.model.joint(j).id]
@@ -467,6 +381,7 @@ class HumanSim:
             if j in self._act:
                 self.data.ctrl[self._act[j]] = x
         if self.mode == "physics":
+            self.face.update(self.data.qpos)
             return
         q = self.data.qpos
         for j, x in self.targets_si.items():
@@ -479,6 +394,7 @@ class HumanSim:
         q[self._qadr["root_z"]] = -min(self.data.site_xpos[i][2] for i in self._soles)
         self.data.qvel[:] = 0.0
         self.mj.mj_forward(self.model, self.data)
+        self.face.update(q)
 
     def targets(self) -> dict:
         """Current targets in degrees (hinges) or meters (slides)."""
@@ -491,6 +407,7 @@ class HumanSim:
         n = int(round(min(max(seconds, 0.0), 0.25) / self.model.opt.timestep))
         if n:
             self.mj.mj_step(self.model, self.data, nstep=n)
+            self.face.update(self.data.qpos)
 
     def angle(self, joint: str) -> float:
         x = self.data.qpos[self._qadr[joint]]
@@ -499,7 +416,7 @@ class HumanSim:
     def errors(self) -> dict:
         """Target minus actual per body joint, degrees (always 0 in kinematic mode)."""
         return {j: math.degrees(x - self.data.qpos[self._qadr[j]]) for j, x in self.targets_si.items()
-                if self.kind.get(j) == "hinge" and j not in FACE_JOINTS}
+                if self.kind.get(j) == "hinge" and j not in self.face_channels}
 
     def status(self) -> str:
         if self.mode == "kinematic":
@@ -515,17 +432,33 @@ class HumanSim:
         return self.data.body(name).xpos.copy()
 
     # ----------------------------------------------------------------- pictures
-    def _render(self, camera, width, height):
+    def _render(self, camera, width, height, option=None):
         rs = self._renderer = self._renderer or {}
         r = rs.get((width, height))
         if r is None:
             r = rs[(width, height)] = self.mj.Renderer(self.model, height=height, width=width)
-        r.update_scene(self.data, camera=camera)
+        r.update_scene(self.data, camera=camera, scene_option=option)
         return r.render()
+
+    def render_mechanism(self, width: int = 640, height: int = 480, skin_alpha: float = 0.22) -> np.ndarray:
+        """The face close-up with the skin see-through, showing the servos, wires and anchors under it."""
+        opt = self.mj.MjvOption()
+        opt.geomgroup[animatronic.MECH_GROUP] = 1
+        opt.tendongroup[animatronic.MECH_GROUP] = 1
+        rgba = self.model.skin_rgba.copy()
+        for name in animatronic.DEFORMING:
+            sid = self.mj.mj_name2id(self.model, self.mj.mjtObj.mjOBJ_SKIN, name)
+            self.model.skin_rgba[sid, 3] = skin_alpha
+        try:
+            return self._render("face", width, height, opt).copy()
+        finally:
+            self.model.skin_rgba[:] = rgba
 
     def render(self, camera: str = "split", width: int = 640, height: int = 480) -> np.ndarray:
         """RGB image from a named camera: front, face, side, three_quarter or eyes; "split" is the front view with
-        the face close-up in the corner."""
+        the face close-up in the corner; "animatronic" is the face with its mechanism showing through the skin."""
+        if camera == "animatronic":
+            return self.render_mechanism(width, height)
         if camera != "split":
             return self._render(camera, width, height).copy()
         body = self._render("front", width, height).copy()

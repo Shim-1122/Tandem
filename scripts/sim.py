@@ -98,12 +98,15 @@ def main(argv=None):
                     help="arm driven by one-arm or hand-view recordings (their columns have no L_ or R_)")
     ap.add_argument("--seconds", type=float, default=20.0, help="demo length (the viewer loops it until closed)")
     ap.add_argument("--video", type=Path, help="render to this video file instead of opening the viewer")
-    ap.add_argument("--camera", choices=["front", "side", "top", "eyes", "split", "face", "three_quarter"],
+    ap.add_argument("--camera", choices=["front", "side", "top", "eyes", "split", "face", "animatronic",
+                                         "three_quarter"],
                     default=None, help="video camera (robot: front; human: split, the body with the face close-up)")
     ap.add_argument("--human", action="store_true", help="the full human body instead of the robot")
     ap.add_argument("--mode", choices=["kinematic", "physics"], default="kinematic",
                     help="human: joints straight on the angles (kinematic) or servos under gravity (physics)")
     ap.add_argument("--no-mirror", action="store_true", help="human: copy left and right instead of mirroring")
+    ap.add_argument("--face-rig", choices=["cogley", "full"], default="cogley",
+                    help="human: Will Cogley's 16 skin servos, or one actuator per facial movement")
     ap.add_argument("--size", default="1280x720", help="video size, WIDTHxHEIGHT")
     ap.add_argument("--fps", type=int, default=30, help="video frame rate")
     ap.add_argument("--no-scene", action="store_true", help="the robot alone (no floor, table or ball)")
@@ -116,7 +119,7 @@ def main(argv=None):
     if a.save_xml:
         if a.human:
             from vtrack.human import build_xml as human_xml
-            text = human_xml(floating=a.mode == "kinematic", scene=not a.no_scene)
+            text = human_xml(floating=a.mode == "kinematic", scene=not a.no_scene, rig=a.face_rig)
         else:
             text = build_xml(scene=not a.no_scene)
         a.save_xml.write_text(text, encoding="utf-8")
@@ -124,7 +127,8 @@ def main(argv=None):
         return
     if a.human:
         from vtrack.human import HumanSim
-        sim = HumanSim(mode=a.mode, scene=not a.no_scene, hand_side=a.hand_side, mirror=not a.no_mirror)
+        sim = HumanSim(mode=a.mode, scene=not a.no_scene, hand_side=a.hand_side, mirror=not a.no_mirror,
+                       rig=a.face_rig)
         demo = human_demo_values
     else:
         sim = TandemSim(scene=not a.no_scene, hand_side=a.hand_side)

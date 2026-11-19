@@ -99,6 +99,7 @@ class Config:
     sim_mirror: bool = True            # human: move like your reflection
     face_source: str = "auto"          # human: auto | blendshapes | emotion (see face_rig.py)
     emotion_gain: float = 1.25         # human: strength of the emotion presets (0 = blendshapes only)
+    face_rig: str = "cogley"           # human: cogley (Will Cogley's 16 skin servos) | full (one per movement)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
     model_dir: str = "models"
@@ -290,7 +291,8 @@ class App:
                 if cfg.sim == "human":
                     from .human import HumanSim
                     self.sim = HumanSim(mode=cfg.sim_mode, hand_side=arm, mirror=cfg.sim_mirror,
-                                        face_source=cfg.face_source, emotion_gain=cfg.emotion_gain)
+                                        face_source=cfg.face_source, emotion_gain=cfg.emotion_gain,
+                                        rig=cfg.face_rig)
                 else:
                     from .sim import TandemSim
                     self.sim = TandemSim(hand_side=arm)

@@ -1,7 +1,6 @@
 """The full human in MuJoCo: its legs, pelvis and core read back through the tracker's own solvers as the angles that
 posed them, the arms match the tracker's forward kinematics, mirror mode swaps sides, the feet stay on the floor,
 and the face follows blendshapes and emotions."""
-import math
 
 import numpy as np
 import pytest
@@ -118,27 +117,112 @@ def test_mirror_mode_moves_the_reflected_arm():
         h.close()
 
 
-def test_face_follows_blendshapes_and_holds_without_them(human):
-    human.command({"bs_jawOpen": 1.0, "bs_eyeBlinkRight": 1.0, "bs_mouthSmileLeft": 1.0, "bs_browInnerUp": 1.0})
-    assert human.angle("jaw_open") == pytest.approx(26.0, abs=1e-6)
-    assert human.angle("R_eyelid") > 80 and human.angle("L_eyelid") < 30        # only the right eye closed
-    assert human.angle("L_mouth_corner_up") > human.angle("R_mouth_corner_up")   # one-sided smile
-    assert human.angle("R_brow_inner") > 0.01
-    jaw = human.angle("jaw_open")
-    human.command({"bs_jawOpen": float("nan")})                                  # face lost: hold
-    assert human.angle("jaw_open") == pytest.approx(jaw)
+def skin_landmarks(h: HumanSim) -> np.ndarray:
+    """The face's 68 landmarks on the skin as rendered, in the head's frame (x forward, y left, z up), so the
+    body's pose does not matter."""
+    f = h.face
+    pts = f.skin_points(h.model, h.data, "skin")
+    first = {int(v): i for i, v in reversed(list(enumerate(f.d["skin_src"])))}
+    head = h.data.body("head")
+    return (pts[[first[int(i)] for i in f.d["landmarks"]]] - head.xpos) @ head.xmat.reshape(3, 3)
+
+
+def face_only(h: HumanSim, bs: dict, **extra) -> np.ndarray:
+    h.command({**{f"bs_{n}": 0.0 for n in face_rig.BLENDSHAPES}, **{f"bs_{k}": v for k, v in bs.items()}, **extra})
+    return skin_landmarks(h)
+
+
+@pytest.fixture(scope="module")
+def full():
+    h = HumanSim(mirror=False, smooth_face=False, rig="full", scene=False)
+    yield h
+    h.close()
+
+
+def test_the_full_rig_reproduces_each_sculpted_movement(full):
+    """One actuator per movement: at full travel the skin sits exactly on ICT's sculpt (rest plus its field)."""
+    f, d = full.face, full.face.d
+    sid = full.mj.mj_name2id(full.model, full.mj.mjtObj.mjOBJ_SKIN, "skin")
+    adr = int(full.model.skin_vertadr[sid])
+    rows = f.row[d["skin_src"]]
+    for name in ("mouthSmileLeft", "browDownRight", "eyeBlinkLeft", "mouthPucker"):
+        face_only(full, {name: 1.0})
+        i = f.inputs.index(name)
+        want = d["base"][d["skin_src"]].astype(np.float64)
+        on = rows >= 0
+        want[on] += d["move_fields"][i][rows[on]]
+        got = full.model.skin_vert[adr:adr + len(want)]
+        assert np.abs(got - want).max() < 2e-6, name
+
+
+def test_the_jaw_hinge_carries_the_teeth_and_opens_the_mouth(human):
+    rest = face_only(human, {})
+    teeth = human.face.skin_points(human.model, human.data, "teeth_lower")
+    opened = face_only(human, {"jawOpen": 1.0})
+    assert human.angle("jaw_open") == pytest.approx(np.degrees(human.face.jaw["open"]), abs=1e-6)
+    gap = np.linalg.norm(opened[66] - opened[62]) - np.linalg.norm(rest[66] - rest[62])
+    assert gap > 0.02                                                    # lips part by over 2 cm
+    moved = np.linalg.norm(human.face.skin_points(human.model, human.data, "teeth_lower") - teeth, axis=1)
+    assert moved.max() > 0.02 and opened[8][2] < rest[8][2] - 0.02       # lower teeth and chin drop
+
+
+def lid_gap(lm, side):
+    up, low = ((37, 38), (41, 40)) if side == "R" else ((43, 44), (47, 46))
+    return float(np.mean([np.linalg.norm(lm[u] - lm[v]) for u, v in zip(up, low)]))
+
+
+@pytest.mark.parametrize("rig", ["cogley", "full"])
+def test_blink_smile_and_hold(rig, human, full):
+    h = human if rig == "cogley" else full
+    rest = face_only(h, {})
+    blink = face_only(h, {"eyeBlinkRight": 1.0})
+    assert lid_gap(blink, "R") < 0.45 * lid_gap(rest, "R")               # the right eye closes
+    assert lid_gap(blink, "L") > 0.7 * lid_gap(rest, "L")                # the left stays open
+    smile = face_only(h, {"mouthSmileLeft": 1.0, "mouthSmileRight": 1.0})
+    for corner in (48, 54):
+        assert smile[corner][2] > rest[corner][2] + 0.003                # both corners rise
+    assert abs((smile[48] - rest[48])[2] - (smile[54] - rest[54])[2]) < 5e-4   # evenly
+    held = skin_landmarks(h)
+    h.command({"bs_jawOpen": float("nan")})                              # face lost: hold
+    assert np.allclose(skin_landmarks(h), held)
+
+
+def test_the_cogley_rig_is_symmetric_and_names_his_channels(human):
+    names = {"MID_RIGHT_BROW", "FAR_LEFT_BROW", "TOP_RIGHT_LID", "LOW_LEFT_LID", "TOP_RIGHT_LIP", "LOW_LEFT_LIP",
+             "TOP_LEFT_CHEEK", "LOW_RIGHT_CHEEK"}
+    face_only(human, {"mouthSmileLeft": 0.8, "mouthSmileRight": 0.8, "browInnerUp": 0.6, "jawOpen": 0.3})
+    cmd = human.servo_commands()
+    assert names <= set(cmd) and len(cmd) == 17 and cmd["jaw_open"] == pytest.approx(0.3)
+    for k, v in cmd.items():
+        if "RIGHT" in k:
+            assert v == pytest.approx(cmd[k.replace("RIGHT", "LEFT")], abs=1e-4), k
+        assert -1.0 <= v <= 1.0
+    travel = [s["travel"] for s in human.face.servos]
+    assert 0.005 < min(travel) and max(travel) < 0.03                    # 5 to 30 mm, like real linkages
+
+
+def test_mirror_mode_smiles_with_the_reflected_side():
+    h = HumanSim(mirror=True, smooth_face=False, rig="full", scene=False)
+    try:
+        rest = face_only(h, {})
+        lm = face_only(h, {"mouthSmileLeft": 1.0})                       # your left corner ...
+        assert lm[48][2] - rest[48][2] > 0.005                           # ... is the avatar's right
+        assert lm[54][2] - rest[54][2] < 0.002
+    finally:
+        h.close()
 
 
 def test_emotion_presets_drive_the_face(human):
     def face(emotion):
         human.command({**{f"bs_{n}": 0.0 for n in face_rig.BLENDSHAPES},
                        **{f"emotion_{e}_pct": 100.0 * (e == emotion) for e in face_rig.EMOTION_NAMES}})
-        return {k: human.angle(k) for k in face_rig.FACE_JOINTS}
+        return skin_landmarks(human)
 
     neutral, happy, surprised, angry = face("neutral"), face("happy"), face("surprised"), face("angry")
-    assert happy["R_mouth_corner_up"] > neutral["R_mouth_corner_up"] + 0.008
-    assert surprised["jaw_open"] > 10 and surprised["R_eyelid"] < neutral["R_eyelid"]
-    assert angry["R_brow_inner"] < neutral["R_brow_inner"] - 0.006
+    assert happy[48][2] > neutral[48][2] + 0.003
+    assert np.linalg.norm(surprised[66] - surprised[62]) > np.linalg.norm(neutral[66] - neutral[62]) + 0.01
+    assert surprised[19][2] > neutral[19][2] + 0.003                     # brows up
+    assert angry[21][2] < neutral[21][2] - 0.001                         # inner brows down
 
 
 def test_face_sources():
@@ -148,8 +232,13 @@ def test_face_sources():
     assert face_rig.combine(bs, emo, "emotion")["mouthSmileLeft"] == pytest.approx(min(1.0, 1.25 * 0.9))
     assert face_rig.combine(bs, None, "auto") == bs
     assert face_rig.combine(bs, emo, "auto")["mouthSmileLeft"] == pytest.approx(1.0)
-    for v in face_rig.face_pose({n: 1.0 for n in face_rig.BLENDSHAPES}).values():
-        assert math.isfinite(v)
+
+
+def test_lids_follow_the_eyes(human):
+    rest = face_only(human, {})
+    up = face_only(human, {}, eye_pitch=20.0)
+    assert human.angle("R_eye_pitch") == pytest.approx(20.0, abs=1e-6)
+    assert up[37][2] > rest[37][2] + 0.0005                              # the upper lid rises with the gaze
 
 
 def test_physics_mode_holds_a_pose():
@@ -195,7 +284,7 @@ def test_live_app_drives_the_human_with_blendshapes(tmp_path):
     # mirror mode: the tracked right arm moves the avatar's left arm, and head yaw turns the other way
     assert sim.angle("L_elbow_flexion") == pytest.approx(ARM["elbow_flexion"], abs=0.5)
     assert sim.angle("neck_yaw") == pytest.approx(-HEAD[0], abs=1.0)
-    assert sim.angle("jaw_open") > 15
+    assert sim.angle("jaw_open") > 15 and sim.servo_commands()["jaw_open"] == pytest.approx(0.8, abs=0.05)
     img = app.sim_frame(0.0)
     assert img.shape[2] == 3
     app.close()
@@ -217,7 +306,9 @@ def test_live_options_for_the_human_sim():
     live = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(live)
     cfg = live.parse_args(["--sim", "human", "--camera", "rtsp://10.0.0.5:8554/live", "--no-mirror",
-                           "--face-source", "emotion"])
+                           "--face-source", "emotion", "--face-rig", "full", "--sim-camera", "animatronic"])
+    assert cfg.face_rig == "full" and cfg.sim_camera == "animatronic"
+    assert live.parse_args([]).face_rig == "cogley"
     assert cfg.sim == "human" and cfg.camera == "rtsp://10.0.0.5:8554/live" and not cfg.sim_mirror
     assert cfg.face_source == "emotion"
     assert live.parse_args(["--sim"]).sim == "robot" and live.parse_args([]).sim is False

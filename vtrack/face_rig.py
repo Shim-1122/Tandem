@@ -1,4 +1,4 @@
-"""Facial expressions for the simulated human: tracker values in, face joint targets out.
+"""Facial expressions for the simulated human: tracker values in, the blendshapes that drive the animatronic face out.
 
 Two sources drive the face, and they can be used together:
   * MediaPipe's 52 face blendshapes (ARKit names, 0..1), from the same face model that already tracks the head.
@@ -11,10 +11,11 @@ Two sources drive the face, and they can be used together:
 `source` "auto" takes, for each blendshape, the larger of the measured value and the emotion preset; "blendshapes"
 or "emotion" uses one source only.
 
-Left and Right in blendshape names are the person's own sides (MediaPipe follows ARKit). The face joints use the
-robot's prefixes: R_ is the person's right (copy mode). vtrack.human swaps sides for mirror mode.
+The face is an animatronic head (vtrack/animatronic.py, laid out like Will Cogley's DIY robot head): its servos
+turn by their share of each blendshape, as on the real head.
 
-Units: hinge joints in degrees, slide joints in meters.
+Left and Right in blendshape names are the person's own sides (MediaPipe follows ARKit). The servos use the
+robot's prefixes: R_ is the person's right (copy mode). vtrack.human swaps sides for mirror mode.
 """
 from __future__ import annotations
 
@@ -68,32 +69,6 @@ EMOTION_PRESETS = {
 }
 EMOTION_NAMES = list(EMOTION_PRESETS)
 
-# Face joints: name -> (kind, low, high, rest). Hinges in degrees, slides in meters.
-FACE_JOINTS = {
-    "jaw_open": ("hinge", -2.0, 30.0, 0.0),
-    "jaw_side": ("slide", -0.008, 0.008, 0.0),
-    "upper_lip_up": ("slide", -0.004, 0.010, 0.0),
-    "upper_lip_forward": ("slide", -0.004, 0.012, 0.0),
-    "lower_lip_down": ("slide", -0.020, 0.012, 0.0),
-    "lower_lip_forward": ("slide", -0.004, 0.012, 0.0),
-}
-for _p in ("R_", "L_"):
-    FACE_JOINTS.update({
-        _p + "eyelid": ("hinge", -15.0, 90.0, 25.0),        # upper lid: 0 on top of the eye, about 85 closed
-        _p + "lower_lid": ("hinge", 0.0, 55.0, 18.0),
-        _p + "brow_inner": ("slide", -0.012, 0.014, 0.0),
-        _p + "brow_mid": ("slide", -0.012, 0.014, 0.0),
-        _p + "brow_outer": ("slide", -0.012, 0.014, 0.0),
-        _p + "mouth_corner_up": ("slide", -0.020, 0.016, 0.0),
-        _p + "mouth_corner_out": ("slide", -0.012, 0.012, 0.0),
-        _p + "cheek_raise": ("slide", 0.0, 0.012, 0.0),
-        _p + "cheek_puff": ("slide", 0.0, 0.012, 0.0),
-        _p + "nose_sneer": ("slide", 0.0, 0.006, 0.0),
-    })
-LID_CLOSED = 85.0
-JAW_TO_LIP = 0.087          # meters from the jaw hinge to the lips: how far the lower lip drops per radian
-
-
 def _num(v) -> float:
     try:
         x = float(v)
@@ -145,52 +120,9 @@ def combine(bs: dict | None, emo: dict | None, source: str = "auto", gain: float
     return {k: max(bs.get(k, 0.0), eb.get(k, 0.0)) for k in set(bs) | set(eb)}
 
 
-def face_pose(bs: dict) -> dict:
-    """Face joint targets (degrees or meters, within FACE_JOINTS ranges) from blendshapes (missing names are 0)."""
-    g = bs.get
-    jaw = 26.0 * g("jawOpen", 0.0)
-    jaw_drop = JAW_TO_LIP * math.sin(math.radians(jaw))
-    out = {"jaw_open": jaw, "jaw_side": 0.008 * (g("jawLeft", 0.0) - g("jawRight", 0.0))}
-    pucker, funnel = g("mouthPucker", 0.0), g("mouthFunnel", 0.0)
-    press = 0.5 * (g("mouthPressLeft", 0.0) + g("mouthPressRight", 0.0))
-    shift = g("mouthLeft", 0.0) - g("mouthRight", 0.0)            # whole mouth toward the person's left
-    for p, s, toward_left in (("R_", "Right", -1.0), ("L_", "Left", 1.0)):
-        blink, wide, squint = g(f"eyeBlink{s}", 0.0), g(f"eyeWide{s}", 0.0), g(f"eyeSquint{s}", 0.0)
-        cheek_sq, smile = g(f"cheekSquint{s}", 0.0), g(f"mouthSmile{s}", 0.0)
-        down, outer_up, inner_up = g(f"browDown{s}", 0.0), g(f"browOuterUp{s}", 0.0), g("browInnerUp", 0.0)
-        inner = 0.013 * inner_up - 0.010 * down
-        outer = 0.012 * outer_up - 0.005 * down
-        out.update({
-            p + "eyelid": 25.0 + 62.0 * blink - 32.0 * wide + 10.0 * squint,
-            p + "lower_lid": 18.0 + 22.0 * squint + 16.0 * cheek_sq + 4.0 * smile,
-            p + "brow_inner": inner,
-            p + "brow_mid": 0.55 * inner + 0.45 * outer,
-            p + "brow_outer": outer,
-            p + "mouth_corner_up": (0.013 * smile - 0.011 * g(f"mouthFrown{s}", 0.0)
-                                    - 0.003 * g(f"mouthStretch{s}", 0.0) - 0.45 * jaw_drop),
-            p + "mouth_corner_out": (0.007 * smile + 0.010 * g(f"mouthStretch{s}", 0.0)
-                                     + 0.004 * g(f"mouthDimple{s}", 0.0) - 0.011 * pucker - 0.007 * funnel
-                                     - 0.002 * g(f"mouthPress{s}", 0.0) + 0.008 * toward_left * shift),
-            p + "cheek_raise": 0.009 * cheek_sq + 0.004 * smile,
-            p + "cheek_puff": 0.012 * g("cheekPuff", 0.0),
-            p + "nose_sneer": 0.006 * g(f"noseSneer{s}", 0.0),
-        })
-    up_up = 0.5 * (g("mouthUpperUpLeft", 0.0) + g("mouthUpperUpRight", 0.0))
-    low_down = 0.5 * (g("mouthLowerDownLeft", 0.0) + g("mouthLowerDownRight", 0.0))
-    out.update({
-        "upper_lip_up": 0.008 * up_up - 0.003 * g("mouthRollUpper", 0.0) + 0.002 * g("mouthShrugUpper", 0.0),
-        "upper_lip_forward": 0.010 * pucker + 0.008 * funnel - 0.003 * g("mouthRollUpper", 0.0),
-        # mouthClose keeps the lips together while the jaw is open: the lower lip rises by what the jaw dropped
-        "lower_lip_down": (0.009 * low_down + 0.003 * g("mouthRollLower", 0.0) - 0.004 * g("mouthShrugLower", 0.0)
-                           - 0.002 * press - g("mouthClose", 0.0) * jaw_drop),
-        "lower_lip_forward": (0.010 * pucker + 0.008 * funnel - 0.003 * g("mouthRollLower", 0.0)
-                              + 0.004 * g("mouthShrugLower", 0.0)),
-    })
-    return {k: min(FACE_JOINTS[k][2], max(FACE_JOINTS[k][1], v)) for k, v in out.items()}
-
-
-def rest_pose() -> dict:
-    return {k: v[3] for k, v in FACE_JOINTS.items()}
+# MediaPipe gives one browInnerUp for both brows; the face has a servo on each side
+INPUT_ALIAS = {"browInnerUpLeft": "browInnerUp", "browInnerUpRight": "browInnerUp"}
+GAZE_FULL = (30.0, 25.0)        # eye yaw and pitch (degrees) at a full eyeLook movement
 
 
 def gaze_from_blendshapes(bs: dict) -> tuple[float, float]:
@@ -201,4 +133,4 @@ def gaze_from_blendshapes(bs: dict) -> tuple[float, float]:
     yaw_l = g("eyeLookOutLeft", 0.0) - g("eyeLookInLeft", 0.0)
     pitch = 0.5 * (g("eyeLookUpLeft", 0.0) + g("eyeLookUpRight", 0.0)
                    - g("eyeLookDownLeft", 0.0) - g("eyeLookDownRight", 0.0))
-    return 30.0 * 0.5 * (yaw_r + yaw_l), 25.0 * pitch
+    return GAZE_FULL[0] * 0.5 * (yaw_r + yaw_l), GAZE_FULL[1] * pitch

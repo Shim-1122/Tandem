@@ -106,7 +106,8 @@ def parse_args(argv=None) -> Config:
                     help="also show a MuJoCo sim copying you, in a second window (pip install mujoco): --sim or "
                          "--sim robot for the Tandem robot, --sim human for a full human body with your facial "
                          "expressions")
-    ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes", "split", "face", "three_quarter"],
+    ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes", "split", "face", "animatronic",
+                                             "three_quarter"],
                     default=None, help="first sim view (key v switches); human: split shows the face close-up too")
     ap.add_argument("--sim-mode", choices=["kinematic", "physics"], default="kinematic",
                     help="human: kinematic puts every joint straight on the tracked angle (no lag); physics drives "
@@ -117,6 +118,9 @@ def parse_args(argv=None) -> Config:
                     help="human: what drives the face: the face blendshapes, the emotion model, or both (auto)")
     ap.add_argument("--emotion-gain", type=float, default=1.25,
                     help="human: strength of the emotion expressions (0 = blendshapes only)")
+    ap.add_argument("--face-rig", choices=["cogley", "full"], default="cogley",
+                    help="human: the face's servos: cogley, the 16 skin servos of Will Cogley's DIY robot head (what a "
+                         "buildable head can show), or full, one per facial movement (every measured movement)")
     a = ap.parse_args(argv)
     cores = os.cpu_count() or 2
     if a.fast:                                       # the preset fills in only what was not given
@@ -147,7 +151,8 @@ def parse_args(argv=None) -> Config:
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
                   record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz,
                   gpu=a.gpu, sim=a.sim or False, sim_camera=a.sim_camera, sim_mode=a.sim_mode,
-                  sim_mirror=not a.no_mirror, face_source=a.face_source, emotion_gain=a.emotion_gain)
+                  sim_mirror=not a.no_mirror, face_source=a.face_source, emotion_gain=a.emotion_gain,
+                  face_rig=a.face_rig)
 
 
 def fast_workers(cores: int, model: str) -> int:
