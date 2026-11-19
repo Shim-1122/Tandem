@@ -149,11 +149,16 @@ def _capsule(m, a, b, r, rgba, name=""):
 
 
 BONE, JOINT_RGBA, MUSCLE, SHELL = "0.85 0.83 0.78 1", "0.25 0.27 0.30 1", "0.75 0.30 0.25 1", "0.92 0.92 0.95 0.45"
+# Colors of the arm parts. vtrack.human passes its own (skin and sleeves); the joints and sizes stay the same.
+ROBOT_LOOK = {"finger": BONE, "palm": MUSCLE, "upper": MUSCLE, "fore": MUSCLE, "shoulder": JOINT_RGBA,
+              "joint": JOINT_RGBA}
 
 
-def _hand(m: _Mjcf, s: _Side):
+def _hand(m: _Mjcf, s: _Side, look: dict | None = None):
+    look = look or ROBOT_LOOK
+    BONE, JOINT_RGBA = look["finger"], look["joint"]   # noqa: N806 (shadow the robot colors for this hand)
     p = s.p
-    m.add(f'<geom type="box" pos="{_f(s.pos(T2M @ [0, -0.045, 0]))}" size="0.042 0.013 0.045" rgba="{MUSCLE}" '
+    m.add(f'<geom type="box" pos="{_f(s.pos(T2M @ [0, -0.045, 0]))}" size="0.042 0.013 0.045" rgba="{look["palm"]}" '
           f'class="robot"/>')
     m.add(f'<site name="{p}knuckle" pos="{_f(s.pos(T2M @ NOMINAL_HAND["middle"]["base"]))}" size="0.004"/>')
     for name in FINGERS4:
@@ -195,28 +200,31 @@ def _hand(m: _Mjcf, s: _Side):
         m.close("body")
 
 
-def _arm(m: _Mjcf, side: str):
-    """Shoulder (Z-X-Y like the tracker), elbow, then forearm rotation and the wrist at the hand."""
+def _arm(m: _Mjcf, side: str, origin=None, look: dict | None = None):
+    """Shoulder (Z-X-Y like the tracker), elbow, then forearm rotation and the wrist at the hand.
+    `origin` is the right shoulder joint in the parent body (mirrored for the left); `look` the colors."""
+    look = look or ROBOT_LOOK
     s = _Side(side)
     p = s.p
-    m.open(f'<body name="{p}upper_arm" pos="{_f(s.pos([0, -SHOULDER_HALF, TRUNK]))}">')
+    origin = [0, -SHOULDER_HALF, TRUNK] if origin is None else origin
+    m.open(f'<body name="{p}upper_arm" pos="{_f(s.pos(origin))}">')
     m.joint(p + "shoulder_flexion", s.axis([0, -1, 0]), ARM_RANGES["shoulder_flexion"], "shoulder")
     m.joint(p + "shoulder_abduction", s.axis([-1, 0, 0]), ARM_RANGES["shoulder_abduction"], "shoulder")
     m.joint(p + "shoulder_rotation", s.axis([0, 0, 1]), ARM_RANGES["shoulder_rotation"], "shoulder")
-    m.add(f'<geom type="sphere" size="0.05" rgba="{JOINT_RGBA}" class="robot"/>')
-    _capsule(m, [0, 0, -0.04], [0, 0, -UPPER_ARM + 0.03], 0.045, MUSCLE)
+    m.add(f'<geom type="sphere" size="0.05" rgba="{look["shoulder"]}" class="robot"/>')
+    _capsule(m, [0, 0, -0.04], [0, 0, -UPPER_ARM + 0.03], 0.045, look["upper"])
     m.open(f'<body name="{p}forearm" pos="0 0 {-UPPER_ARM}">')
     m.joint(p + "elbow_flexion", s.axis([0, -1, 0]), ARM_RANGES["elbow_flexion"], "elbow")
     m.add(f'<site name="{p}elbow" size="0.006"/>')
-    m.add(f'<geom type="sphere" size="0.04" rgba="{JOINT_RGBA}" class="robot"/>')
-    _capsule(m, [0, 0, -0.03], [0, 0, -FOREARM + 0.02], 0.036, MUSCLE)
+    m.add(f'<geom type="sphere" size="0.04" rgba="{look["joint"]}" class="robot"/>')
+    _capsule(m, [0, 0, -0.03], [0, 0, -FOREARM + 0.02], 0.036, look["fore"])
     m.open(f'<body name="{p}hand" pos="0 0 {-FOREARM}">')
     m.joint(p + "forearm_rotation", s.axis([0, 0, 1]), ARM_RANGES["forearm_rotation"], "wrist")
     m.joint(p + "wrist_flexion", s.axis([1, 0, 0]), ARM_RANGES["wrist_flexion"], "wrist")
     m.joint(p + "wrist_deviation", s.axis([0, -1, 0]), ARM_RANGES["wrist_deviation"], "wrist")
     m.add(f'<site name="{p}wrist" size="0.006"/>')
-    m.add(f'<geom type="sphere" size="0.025" rgba="{JOINT_RGBA}" class="robot"/>')
-    _hand(m, s)
+    m.add(f'<geom type="sphere" size="0.025" rgba="{look["joint"]}" class="robot"/>')
+    _hand(m, s, look)
     m.close("body")
     m.close("body")
     m.close("body")

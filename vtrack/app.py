@@ -17,6 +17,7 @@ from .draw import (CYAN, HAND_EDGES, POSE_ARM_EDGES, POSE_LEG_EDGES, YELLOW, com
                    draw_wireframe, render_arms_panel, render_face_panel, render_hand_panel, text_block)
 from .elbow import ElbowPredictor, SegmentLengths
 from .emotion_cal import CalibrationSession, calibration_path, load_all
+from .face_rig import BLENDSHAPES, BS_COLS
 from .face import EMOTIONS, EmotionSmoother, EmotionTask, softmax
 from .filters import HAND_SMOOTHING, AngleSmoother, JitterMeter, LandmarkSmoother, OneEuroFilter, make_arm_smoothers
 from .gaze import GazeCalibrationSession, TargetLock, calibration_targets, eye_state
@@ -55,7 +56,7 @@ VIS = 0.6
 @dataclass
 class Config:
     mode: str = "body"                 # body | pov
-    camera: int = 0
+    camera: int | str = 0              # camera number, or a phone or network stream URL (see pipeline.open_camera)
     width: int = 1280
     height: int = 720
     fps: int = 60
@@ -90,8 +91,15 @@ class Config:
     pose_workers: int = 1              # instances of the body model
     display_hz: float = 60.0           # redraw the window at most this often; tracking and recording run at full rate
     gpu: bool = False                  # MediaPipe models on the graphics processor (Linux and macOS; falls back to CPU)
-    sim: bool = False                  # show the simulated robot (MuJoCo) copying you, in a second window
-    sim_camera: str = "front"          # front | side | top | eyes (the robot's view)
+    sim: bool | str = False            # show a MuJoCo sim copying you in a second window: True or "robot" for the
+                                       # Tandem robot, "human" for the full human body with facial expressions
+    sim_camera: str | None = None      # first view (robot: front | side | top | eyes; human: split | front | face |
+                                       # side | three_quarter | eyes); None = the sim's first view
+    sim_mode: str = "kinematic"        # human: kinematic (no lag) | physics
+    sim_mirror: bool = True            # human: move like your reflection
+    face_source: str = "auto"          # human: auto | blendshapes | emotion (see face_rig.py)
+    emotion_gain: float = 1.25         # human: strength of the emotion presets (0 = blendshapes only)
+    face_rig: str = "cogley"           # human: cogley (Will Cogley's 16 skin servos) | full (one per movement)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
     model_dir: str = "models"
@@ -145,7 +153,7 @@ def default_models(cfg: Config, size):
 
                 def run(frame):
                     L = fm.process(frame.rgb, frame.t)
-                    return None if L is None else (L, est.solve(L, w, h, K), fm.blink)
+                    return None if L is None else (L, est.solve(L, w, h, K), fm.blink, fm.blendshapes)
                 run.close = fm.close
                 return run
             makers["face"] = face
@@ -254,6 +262,7 @@ class App:
         self.target = TargetLock(self.size[0], self.size[1], self.K, mirrored=not self.pov, dwell_s=cfg.gaze_dwell)
         self.prev_gestures = {}
         self.emotions, self.emotion_res = None, None
+        self.blendshapes = None                     # MediaPipe face blendshapes, last face frame
         self.emo_smooth = EmotionSmoother()
         self.calibrations = load_all(cfg.faces_dir, cfg.emotion_model) if cfg.emotion else {}
         self.cal_session, self.cal_person = None, None
@@ -278,9 +287,18 @@ class App:
         self.sim, self._sim_t = None, None
         try:
             if cfg.sim:
-                from .sim import TandemSim
                 arm = cfg.hand if self.pov else (cfg.side if cfg.side != "both" else "right")
-                self.sim = TandemSim(hand_side=arm)
+                if cfg.sim == "human":
+                    from .human import HumanSim
+                    self.sim = HumanSim(mode=cfg.sim_mode, hand_side=arm, mirror=cfg.sim_mirror,
+                                        face_source=cfg.face_source, emotion_gain=cfg.emotion_gain,
+                                        rig=cfg.face_rig)
+                else:
+                    from .sim import TandemSim
+                    self.sim = TandemSim(hand_side=arm)
+                views = getattr(self.sim, "VIEWS", ["front", "side", "top", "eyes"])
+                if cfg.sim_camera not in views + ["eyes"]:
+                    cfg.sim_camera = views[0]
             if cfg.record:
                 self._open_csv(cfg.record)
         except BaseException:
@@ -558,6 +576,7 @@ class App:
         self.say(f"emotion calibrated for {session.name}: {cal.summary()} ({cal.frames} frames)")
 
     def _update_head(self, r):
+        self.blendshapes = r.value[3] if r.value is not None and len(r.value) > 3 else None
         if r.value is None or r.value[1] is None:
             self.head = self.head_raw = self.face_L = None
             self.head_ang.reset()
@@ -981,7 +1000,7 @@ class App:
         elif k == "o":
             self.show_objects = not self.show_objects
         elif k == "v" and self.sim is not None:
-            views = ["front", "side", "top", "eyes"]
+            views = getattr(self.sim, "VIEWS", ["front", "side", "top"]) + ["eyes"]
             self.cfg.sim_camera = views[(views.index(self.cfg.sim_camera) + 1) % len(views)]
             self.say(f"robot view: {self.cfg.sim_camera}")
         elif k == "e":
@@ -1019,6 +1038,7 @@ class App:
                      "neck_yaw", "neck_pitch", "neck_roll", *[f"emotion_{e}_pct" for e in EMOTIONS], "identity", "match",
                      "emotion_calibrated_for", "eyes_open", "eye_yaw", "eye_pitch", "gaze_x_px", "gaze_y_px",
                      "target_locked", "target_x_px", "target_y_px", "target_ray_x", "target_ray_y", "target_ray_z"]
+            cols += BS_COLS
             for sd in self.sides:
                 p = sd[0].upper() + "_" if len(self.sides) > 1 else ""
                 cols += [p + c for c in GRASP_COLS]
@@ -1086,6 +1106,8 @@ class App:
         row += [int(bool(e and e.valid)), *([round(e.yaw, 2), round(e.pitch, 2)] if e and e.valid else [nan, nan]),
                 *(np.round(g, 1) if g is not None else [nan, nan]), int(self.target.locked),
                 *(np.round(tp, 1) if tp is not None else [nan, nan]), *(np.round(ray, 4) if ray is not None else [nan] * 3)]
+        bs = self.blendshapes
+        row += [round(bs.get(n, nan), 3) for n in BLENDSHAPES] if bs else [nan] * len(BLENDSHAPES)
         for sd in self.sides:
             row += self.grasp_row(sd)
         row.append(self.objects_seen())
@@ -1131,9 +1153,13 @@ class App:
             sim.step(now - self._sim_t)
         self._sim_t = now
         img = np.ascontiguousarray(sim.render(self.cfg.sim_camera, width, height)[:, :, ::-1])
-        err = sim.errors()
-        worst = max(err, key=lambda a: abs(err[a]))
-        self.cv2.putText(img, f"view {self.cfg.sim_camera} (v)   largest lag {worst} {err[worst]:+.0f} deg",
+        if hasattr(sim, "status"):
+            note = sim.status()
+        else:
+            err = sim.errors()
+            worst = max(err, key=lambda a: abs(err[a]))
+            note = f"largest lag {worst} {err[worst]:+.0f} deg"
+        self.cv2.putText(img, f"view {self.cfg.sim_camera} (v)   {note}",
                          (10, 24), self.cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, self.cv2.LINE_AA)
         return img
 

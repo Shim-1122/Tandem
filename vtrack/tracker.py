@@ -174,17 +174,20 @@ class PoseModel(_LandmarkTask):
 
 class FaceModel(_LandmarkTask):
     """Face mesh: 478 landmarks (normalized x, y and relative depth z) for the most prominent face, plus
-    MediaPipe's eye blink scores (0 open .. 1 closed) from its blendshape model."""
+    MediaPipe's 52 face blendshapes (ARKit names, 0..1; the eye blink scores among them)."""
 
     task_name = "FaceLandmarker"
 
     def __init__(self, model_dir: str = "models", gpu: bool = False):
         super().__init__("face", model_dir, gpu, num_faces=1, output_face_blendshapes=True)
         self.blink = None                       # (right eye, left eye) of the person, from the last frame
+        self.blendshapes = None                 # {ARKit name: 0..1} from the last frame
 
     def process(self, rgb: np.ndarray, t_seconds: float) -> np.ndarray | None:
         r = self.detect(rgb, t_seconds)
         self.blink = blink_scores(r.face_blendshapes[0]) if r.face_blendshapes else None
+        self.blendshapes = ({c.category_name: float(c.score) for c in r.face_blendshapes[0]
+                             if not c.category_name.startswith("_")} if r.face_blendshapes else None)
         return _arr(r.face_landmarks[0]) if r.face_landmarks else None
 
 

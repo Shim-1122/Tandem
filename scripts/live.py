@@ -45,13 +45,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # let `python scr
 
 from vtrack.app import App, Config                              # noqa: E402
 from vtrack.filters import SMOOTHING_PRESETS                    # noqa: E402
-from vtrack.pipeline import open_camera                         # noqa: E402
+from vtrack.pipeline import open_camera, parse_camera           # noqa: E402
 
 
 def parse_args(argv=None) -> Config:
     ap = argparse.ArgumentParser(description="Tandem live tracker")
     ap.add_argument("--mode", choices=["body", "pov"], default="body")
-    ap.add_argument("--camera", type=int, default=0, help="camera number (0 is the built-in webcam)")
+    ap.add_argument("--camera", default="0",
+                    help="camera number (0 is the built-in webcam; an iPhone used as a Continuity Camera or a phone in "
+                         "a USB webcam app is another number, see --list-cameras), or a phone stream URL such as "
+                         "http://PHONE_IP:8080/video or rtsp://PHONE_IP:8554/live")
+    ap.add_argument("--list-cameras", action="store_true", help="list the camera numbers that work, then exit")
     ap.add_argument("--width", type=int, default=1280, help="requested camera width")
     ap.add_argument("--height", type=int, default=720, help="requested camera height")
     ap.add_argument("--fps", type=int, default=60, help="requested camera frame rate (the camera may give less)")
@@ -98,10 +102,25 @@ def parse_args(argv=None) -> Config:
                     help="redraw the window at most this often; tracking and recording always run at full rate")
     ap.add_argument("--gpu", action="store_true",
                     help="run the MediaPipe models on the graphics processor (Linux and macOS; falls back to the CPU)")
-    ap.add_argument("--sim", action="store_true",
-                    help="also show the Tandem robot in MuJoCo copying you, in a second window (pip install mujoco)")
-    ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes"], default="front",
-                    help="first robot view (key v switches)")
+    ap.add_argument("--sim", nargs="?", const="robot", choices=["robot", "human"], default=None,
+                    help="also show a MuJoCo sim copying you, in a second window (pip install mujoco): --sim or "
+                         "--sim robot for the Tandem robot, --sim human for a full human body with your facial "
+                         "expressions")
+    ap.add_argument("--sim-camera", choices=["front", "side", "top", "eyes", "split", "face", "animatronic",
+                                             "three_quarter"],
+                    default=None, help="first sim view (key v switches); human: split shows the face close-up too")
+    ap.add_argument("--sim-mode", choices=["kinematic", "physics"], default="kinematic",
+                    help="human: kinematic puts every joint straight on the tracked angle (no lag); physics drives "
+                         "servos under gravity")
+    ap.add_argument("--no-mirror", action="store_true",
+                    help="human: copy your left and right instead of moving like your reflection")
+    ap.add_argument("--face-source", choices=["auto", "blendshapes", "emotion"], default="auto",
+                    help="human: what drives the face: the face blendshapes, the emotion model, or both (auto)")
+    ap.add_argument("--emotion-gain", type=float, default=1.25,
+                    help="human: strength of the emotion expressions (0 = blendshapes only)")
+    ap.add_argument("--face-rig", choices=["cogley", "full"], default="cogley",
+                    help="human: the face's servos: cogley, the 16 skin servos of Will Cogley's DIY robot head (what a "
+                         "buildable head can show), or full, one per facial movement (every measured movement)")
     a = ap.parse_args(argv)
     cores = os.cpu_count() or 2
     if a.fast:                                       # the preset fills in only what was not given
@@ -120,16 +139,20 @@ def parse_args(argv=None) -> Config:
         ap.error("--max-grip-n must be more than 0")
     if a.gaze_dwell < 0:
         ap.error("--gaze-dwell must be 0 or more")
+    if a.emotion_gain < 0:
+        ap.error("--emotion-gain must be 0 or more")
     if not a.name.replace("-", "").replace("_", "").isalnum():
         ap.error("--name may contain only letters, digits, - and _")
-    return Config(mode=a.mode, camera=a.camera, width=a.width, height=a.height, fps=a.fps, side=a.side,
+    return Config(mode=a.mode, camera=parse_camera(a.camera), width=a.width, height=a.height, fps=a.fps, side=a.side,
                   torso=a.torso, pose_model=a.pose_model, smoothing=a.smoothing, pose_only_wrist=a.pose_only_wrist,
                   hand=a.hand, swap_hands=a.swap_hands, fov=a.fov, face=not a.no_face, emotion=not a.no_emotion,
                   emotion_model=a.emotion_model, gaze_dwell=a.gaze_dwell, objects=not a.no_objects,
                   object_model=a.object_model, max_grip_n=a.max_grip_n,
                   name=a.name, faces_dir=a.faces_dir, model_dir=a.model_dir, window_width=a.window_width,
                   record=a.record, hand_workers=hand_workers, pose_workers=pose_workers, display_hz=a.display_hz,
-                  gpu=a.gpu, sim=a.sim, sim_camera=a.sim_camera)
+                  gpu=a.gpu, sim=a.sim or False, sim_camera=a.sim_camera, sim_mode=a.sim_mode,
+                  sim_mirror=not a.no_mirror, face_source=a.face_source, emotion_gain=a.emotion_gain,
+                  face_rig=a.face_rig)
 
 
 def fast_workers(cores: int, model: str) -> int:
@@ -140,6 +163,16 @@ def fast_workers(cores: int, model: str) -> int:
 
 
 def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    if "--list-cameras" in args:
+        from vtrack.pipeline import list_cameras
+        found = list_cameras()
+        for i, w, h in found:
+            print(f"camera {i}: {w}x{h}")
+        if not found:
+            print("no camera opened")
+        print("use one with --camera N (an iPhone Continuity Camera is usually the highest number)")
+        return
     cfg = parse_args(argv)
     import cv2
     cap, actual = open_camera(cfg.camera, cfg.width, cfg.height, cfg.fps)

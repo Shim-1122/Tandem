@@ -37,7 +37,7 @@ recording, with a module that maps angles to 0..1 actuator commands with limits 
 - [What the camera cannot tell you](#what-the-camera-cannot-tell-you)
 - [Recording (CSV columns)](#recording-csv-columns)
 - [For the arm: what is ready and what is not](#for-the-arm-what-is-ready-and-what-is-not)
-- [Robot simulation (MuJoCo)](#robot-simulation-mujoco)
+- [Robot simulation (MuJoCo)](#robot-simulation-mujoco), [Human simulation with facial expressions](#human-simulation-with-facial-expressions), [Phone camera](#phone-camera)
 - [Jarvis: the robot's brain](#jarvis-the-robots-brain)
 - [Verify on your camera first](#verify-on-your-camera-first)
 - [Project layout](#project-layout), [Models](#models), [Tests](#tests), [Troubleshooting](#troubleshooting)
@@ -943,6 +943,85 @@ the middle of something you asked for.
 **Try saying:** "Hey Jarvis, shadow me", "stop mirroring me", "rock paper scissors?", "wave with your left hand",
 "point at me", "look at that" (after locking a gaze target), "give me a thumbs up and nod", "grip gently with your
 right hand", "copy me", "what am I holding?", "relax".
+## Human simulation with facial expressions
+
+`--sim human` shows a full human body in MuJoCo that mirrors you live: both arms and all ten fingers, both legs
+(hip 3, knee, ankle 3 each), the pelvis tilting side to side, the whole core (flexion, side bend and rotation), the
+neck, the eyes, and a face that makes your expressions. The face is built like an animatronic head: a real
+sculpted human face as the skin, over a jaw hinge, eyes on joints and servos laid out like Will Cogley's DIY robot
+head.
+
+```
+python scripts/live.py --sim human                         # live: body plus a face close-up in the corner
+python scripts/live.py --sim human --face-source emotion   # face from the emotion model only
+python scripts/live.py --sim human --face-rig full         # one actuator per facial movement (most accurate)
+python scripts/sim.py --human --video face.mp4 --camera animatronic   # the servos and linkages under the skin
+mjpython scripts/sim.py --human                            # demo in the 3D viewer (python on Windows and Linux)
+python scripts/sim.py --human --csv recordings/run1.csv --video me.mp4
+```
+
+| Option | What it does |
+| --- | --- |
+| `--sim-mode kinematic` (default) | every joint is set straight to the tracked angle, then the body is put on the floor by its lowest foot. No servo lag: the avatar, skin included, adds about 1 ms (median 1.2 ms, 1.7 ms with `--face-rig full`) to the tracking latency |
+| `--sim-mode physics` | servos follow the angles under gravity, as in the robot sim (the pelvis is held in place) |
+| `--no-mirror` | copy your left and right; by default the avatar faces you and moves like your reflection |
+| `--face-source auto` (default) | each facial movement is the larger of the measured blendshape and the emotion preset |
+| `--face-source blendshapes` / `emotion` | one source only |
+| `--emotion-gain 1.25` | strength of the emotion presets (0 turns them off) |
+| `--face-rig cogley` (default) | the 16 skin servos of Will Cogley's head: what a buildable head can show |
+| `--face-rig full` | one actuator per ARKit movement (47): every measured movement exactly as sculpted |
+| `--sim-camera split` | first view; key `v` cycles split, front, face, animatronic (the skin see-through, showing the servos), side, three_quarter and eyes |
+
+**Where the face comes from.** The face model that tracks the head also gives MediaPipe's 52 face blendshapes
+(ARKit names: `jawOpen`, `mouthSmileLeft`, `browInnerUp`, ...). They measure each part of the face every face frame,
+so they are the accurate, low-latency source; they are now recorded as `bs_<name>` columns. The emotion model's
+seven scores drive presets built from each emotion's facial action units (FACS), so the face still shows the
+emotion when the blendshapes are missing. `vtrack/face_rig.py` holds both mappings.
+
+**The face: an animatronic head.** MuJoCo has no blendshapes (morph targets), so the face is built the way a
+real animatronic head is, from parts that move and a skin that follows them (`vtrack/animatronic.py`):
+
+* **Skin:** the [ICT face](https://github.com/USC-ICT/ICT-FaceKit) (USC Institute for Creative Technologies, MIT
+  license), a sculpted human face, head and neck with eyeballs, teeth, gums and tongue. It is a MuJoCo skin, bound to
+  the skull, the jaw and (at the neck) the chest, with a painted texture for skin, lips, brows, lash lines and hair.
+* **Jaw:** a hinge fitted to how ICT's lower teeth move when the jaw opens (25 degrees; the teeth follow a rigid
+  rotation to within 0.2 mm), carrying the lower teeth, gums and tongue.
+* **Eyes:** their own joints, turned together side to side and up and down, with the lids following the gaze.
+* **Servos:** laid out like [Will Cogley's DIY robot head](https://github.com/will-cogley/RobotHead), which is driven
+  by the same MediaPipe face blendshapes: per side a middle and an outer brow servo, an upper and a lower lid, an
+  upper and a lower lip, an upper and a lower cheek. Each is a slide joint for its linkage's travel (7 to 22 mm),
+  with a position actuator as the servo. His tongue servo is left out, and his two jaw servos drive the one hinge.
+  His repository has no license file, so only the layout is followed; none of his code or calibration is used.
+
+How the skin moves: each servo moves its own patch of skin by a fitted field, and their effects add up. The bake
+(`scripts/bake_face.py`) fitted the 16 patches and how far each servo turns for each ARKit movement so that the
+servos reproduce ICT's 47 sculpted movements as closely as 16 servos can, mirror-symmetric, with no patch moving
+skin far from its servo. Like the real head, 16 servos cannot make every movement on its own: the median
+movement comes out with 40 % relative error, and the inner brows and the lids following sideways gaze are the
+hardest. `--face-rig full` gives every movement its own actuator and reproduces each sculpt exactly. The skin is
+computed from the joints' actual positions, so in `--sim-mode physics` servo lag shows on the face.
+
+`HumanSim.servo_commands()` gives the face's servo positions (-1 to 1) by the channel names of Cogley's head
+(`TOP_LEFT_LIP`, `MID_RIGHT_BROW`, ...), a starting point for driving a real one.
+
+**Checked against the tracker.** `tests/test_human.py` poses the body at random, reads MediaPipe-style points back
+off it, and runs them through the tracker's own leg and core solvers: every leg, pelvis and core angle comes back
+within 0.05 degrees. The arms are built by the robot's code and land within 0.01 mm of the tracker's forward
+kinematics. On the face, the full rig puts the skin on ICT's sculpt to within 0.002 mm, and both rigs are checked on
+the landmarks: a blink closes that eye only, a smile lifts both mouth corners evenly, the jaw parts the lips by
+over 2 cm, and the lids rise with the gaze.
+
+## Phone camera
+
+A phone camera is usually sharper and faster than a laptop webcam. From the lowest latency up:
+
+1. **iPhone and Mac: Continuity Camera.** With the iPhone near the Mac (same Apple ID, Wi-Fi and Bluetooth on), it
+   appears as a regular camera. `python scripts/live.py --list-cameras` lists the numbers; the iPhone is usually the
+   highest. Then `--camera N`. A phone mount at chest height, about 2 m away, keeps the whole body in view.
+2. **Any phone over USB:** a USB webcam app (DroidCam, Iriun, Camo) also makes the phone a regular camera number.
+3. **Any phone over Wi-Fi:** a streaming app and its URL, for example IP Webcam on Android
+   (`--camera http://PHONE_IP:8080/video`) or an RTSP camera app (`--camera rtsp://PHONE_IP:8554/live`). Buffering
+   is turned down and the reader keeps only the newest frame, but Wi-Fi still adds tens of milliseconds and jitter.
 
 ## Verify on your camera first
 
@@ -1000,6 +1079,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 | `vtrack/sim.py` | The robot in MuJoCo: the model (built in code, mirrored for the left side), driving it from tracker values, physics and pictures |
 | `scripts/live.py` | Starts the live app from the command line (options listed with `--help`) |
 | `scripts/sim.py` | The simulated robot on its own: demo, recording replay, videos, the model file |
+| `scripts/bake_face.py` | Rebuilds the face (`vtrack/data/face_ict.npz` and its texture) from ICT-FaceKit |
 | `scripts/object_vocab.py` | Rebuilds the object list after editing `vtrack/data/object_prompts.json` |
 | `scripts/eval_stability.py` | Jitter and lag of each smoothing preset on simulated noisy landmarks |
 | `scripts/jarvis.py` | Starts Jarvis, the robot's brain (see [Jarvis](#jarvis-the-robots-brain)) |
@@ -1007,6 +1087,7 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 
 | Folder or file | Contents |
 | --- | --- |
+| `vtrack/data/face_ict.npz`, `face_ict_skin.png` | the face: the ICT skin, teeth and eyes in the head's frame, the jaw fit, the servo fields and blend matrix, and the skin texture (made by `scripts/bake_face.py`; ICT's license is in `vtrack/data/ICT-FaceKit-LICENSE.txt`) |
 | `vtrack/data/` | the object detector (graph and half-precision weights, split into files under 50 MB), `object_prompts.json` (the objects and their phrasings) and `object_vocab.npz` (their text embeddings) |
 | `tests/` | 364 automated tests (see [Tests](#tests)) |
 | `docs/` | the picture of the simulated robot |
