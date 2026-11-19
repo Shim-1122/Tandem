@@ -106,6 +106,7 @@ class Config:
     face_source: str = "auto"          # human: auto | blendshapes | emotion (see face_rig.py)
     emotion_gain: float = 1.25         # human: strength of the emotion presets (0 = blendshapes only)
     face_rig: str = "cogley"           # human: cogley (Will Cogley's 16 skin servos) | full (one per movement)
+    ros2: bool = False                 # publish the tracking as ROS 2 topics (vtrack/ros2.py; needs ROS 2 sourced)
     name: str = "me"                   # name stored when enrolling a face
     record: Path | None = None
     model_dir: str = "models"
@@ -229,6 +230,10 @@ class App:
             self.workers[name] = (WorkerGroup(name, self.camera, [fn] + self.more_fns[name], **kw)
                                   if self.more_fns[name] else ModelWorker(name, self.camera, fn, **kw))
         self._seen = {name: _Cache() for name in self.workers}
+        self.ros = None
+        if cfg.ros2:
+            from .ros2 import TandemPublisher
+            self.ros = TandemPublisher(rig=cfg.face_rig)
         self._last_render = -1e9
         self._arm_t = self._hand_t = -1.0
         self.data_t = None            # capture time of the newest result used (for the CSV)
@@ -351,6 +356,8 @@ class App:
             self.data_t = t if self.data_t is None else max(self.data_t, t)
             if self.writer is not None:
                 self.write_row(self.data_t)
+            if self.ros is not None:
+                self.ros.publish(self.values(), t, name)
         self._after_results()
         return bool(new)
 
@@ -1251,6 +1258,8 @@ class App:
     def close(self):
         if self.sim is not None:
             self.sim.close()
+        if self.ros is not None:
+            self.ros.close()
         stop_all(list(self.workers.values()) + [self.camera])
         for fn in self._all_fns():
             close = getattr(fn, "close", None)
