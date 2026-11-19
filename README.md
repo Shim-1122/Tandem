@@ -39,6 +39,7 @@ recording, with a module that maps angles to 0..1 actuator commands with limits 
 - [For the arm: what is ready and what is not](#for-the-arm-what-is-ready-and-what-is-not)
 - [Robot simulation (MuJoCo)](#robot-simulation-mujoco), [Human simulation with facial expressions](#human-simulation-with-facial-expressions), [Phone camera](#phone-camera)
 - [Jarvis: the robot's brain](#jarvis-the-robots-brain)
+- [ROS 2 (Jetson, Isaac Sim)](#ros-2-jetson-isaac-sim)
 - [Verify on your camera first](#verify-on-your-camera-first)
 - [Project layout](#project-layout), [Models](#models), [Tests](#tests), [Troubleshooting](#troubleshooting)
 
@@ -625,6 +626,18 @@ Everything that could make the hands lag has been taken out of the hand's path:
   because faster would not help, and the object model uses at most 4 threads and leaves 2 cores free.
 - **Smoothing that does not lag:** One Euro filters smooth hard when you hold still and almost not at all
   when you move fast. Gestures use a 0.2 second majority vote that works the same at any frame rate.
+- **Results used the moment they are ready:** each model thread signals when it has a result, and a tracking
+  thread uses it at once (kinematics, recording, ROS 2). The window and the avatar are drawn on the main thread
+  from a snapshot taken in microseconds, so drawing never holds a result back. Before, results were picked up
+  once per camera frame by the same loop that drew the window. Measured with the test suite's fake camera
+  and models: with a 30 fps camera, a result waited 9.9 ms (median) and up to 34 ms (95th percentile) before
+  it was used; now 0.1 ms and 1.7 ms. With the avatar on and a 120 fps camera, 71 ms became 3 ms (95th
+  percentile), and the results used went from 35 to 226 a second. `--sync-display` brings back the old loop.
+- **The per-frame math in Rust (optional):** `pip install ./native` (needs [Rust](https://rustup.rs)) builds
+  `tandem_core`, which takes over the One Euro filters and the hand, arm, leg and core solvers. Each solver runs
+  53 to 99 times faster (hand 192 to 3 microseconds, leg 117 to 1.2), and the tracking work per result halves
+  (0.80 to 0.37 ms). Without it the same Python code runs; `tests/test_native.py` checks both give the same
+  numbers to 1e-9 degrees. `TANDEM_NATIVE=0` uses Python even when it is installed.
 
 The status line reads like `cam 30 fps | hand 30 Hz 35 ms | pose 30 Hz 40 ms | face 30 Hz 25 ms | emotion 10 Hz 30
 ms | objects 8 Hz 90 ms`: rate per model and latency from the moment the camera captured the frame to the moment
@@ -1023,6 +1036,33 @@ A phone camera is usually sharper and faster than a laptop webcam. From the lowe
    (`--camera http://PHONE_IP:8080/video`) or an RTSP camera app (`--camera rtsp://PHONE_IP:8554/live`). Buffering
    is turned down and the reader keeps only the newest frame, but Wi-Fi still adds tens of milliseconds and jitter.
 
+## ROS 2 (Jetson, Isaac Sim)
+
+`--ros2` publishes the tracking as ROS 2 topics, straight from the tracking thread as each result is ready, so
+other processes and computers (the Jetson, Isaac Sim, the robot's controllers) get it without going through the
+window. Run it where ROS 2 is sourced (`source /opt/ros/<distro>/setup.bash`; Humble or newer).
+
+```
+python scripts/live.py --ros2                              # publish
+python scripts/ros2_avatar.py                              # the avatar in its own process (mjpython on macOS)
+python scripts/ros2_avatar.py --isaac /joint_command --rename joints.json --no-avatar   # to Isaac Sim
+ros2 topic hz /tandem/joint_states                         # check the rate
+```
+
+| Topic | sensor_msgs/JointState with |
+| --- | --- |
+| `/tandem/joint_states` | every tracked joint angle in radians, named as the CSV columns (`R_elbow_flexion`, `L_knee_flexion`, `core_rotation`, `neck_yaw`, `R_index_pip`, ...); angles that are not tracked right now are left out |
+| `/tandem/face/blendshapes` | the 52 face blendshapes, 0 to 1 |
+| `/tandem/face/servos` | the animatronic face's servo positions, -1 to 1, by Will Cogley's channel names, and `jaw_open` |
+| `/tandem/emotion` | the seven emotion scores, 0 to 1 |
+
+All four are best effort with a queue of one, so a subscriber always gets the newest pose and nothing piles up,
+and every message is stamped with the time the camera captured its frame (the avatar node prints the latency
+it sees). `JointState` is used for all of them because it carries names with the values. `--rename` takes a
+JSON file mapping Tandem's names to your robot's joint names. The tests run the publisher and the avatar node
+against an in-memory stand-in for ROS 2, not a real ROS 2 install, so check the first run on the Jetson with
+`ros2 topic echo`.
+
 ## Verify on your camera first
 
 None of this has been checked on a live camera yet; do these once on yours.
@@ -1054,7 +1094,9 @@ noisy landmarks, and a few centimeters of elbow or wrist error is several degree
 
 | Module | Purpose |
 | --- | --- |
-| `vtrack/app.py` | The live application: runs the models in threads, combines their results, draws the screen, records CSV |
+| `vtrack/app.py` | The live application: runs the models in threads, uses their results on a tracking thread, draws the screen from snapshots, records CSV |
+| `vtrack/native.py`, `native/` | The Rust core (`tandem_core`, PyO3): filters and the hand, arm, leg and core solvers; optional |
+| `vtrack/ros2.py`, `scripts/ros2_avatar.py` | ROS 2 topics out of the tracker, and a node that drives the avatar or Isaac Sim from them |
 | `vtrack/pipeline.py` | Low-latency capture and model threads (newest frame only), CPU priority for hands, rate and latency meters |
 | `vtrack/tracker.py` | MediaPipe Tasks wrappers (hand, pose, face mesh; VIDEO mode), model download, hand-to-arm matching by position |
 | `vtrack/head.py` | Head pose with 6 DOF (position and yaw, pitch, roll) from 4 anchor points on the face |
