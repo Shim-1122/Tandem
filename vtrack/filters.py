@@ -5,13 +5,21 @@ import math
 
 import numpy as np
 
+from . import native as _native
+
 
 class OneEuroFilter:
-    """Works on scalars or numpy arrays. Call with the sample and its timestamp in seconds."""
+    """Works on scalars or numpy arrays. Call with the sample and its timestamp in seconds.
 
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.05, d_cutoff: float = 1.0):
+    `native`: run in Rust (vtrack.native; None = whenever it is installed). A tuple `min_cutoff` gives one cutoff
+    per element of the array's last axis."""
+
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.05, d_cutoff: float = 1.0,
+                 native: bool | None = None):
         self.min_cutoff, self.beta, self.d_cutoff = min_cutoff, beta, d_cutoff
         self._x = self._dx = self._t = None
+        self._core = (_native.core.OneEuro([float(c) for c in np.atleast_1d(min_cutoff)], beta, d_cutoff)
+                      if _native.use(native) else None)
 
     @staticmethod
     def _alpha(cutoff, dt):
@@ -19,6 +27,11 @@ class OneEuroFilter:
         return 1.0 / (1.0 + tau / dt)
 
     def __call__(self, x, t: float):
+        if self._core is not None:
+            x = np.asarray(x, dtype=float)
+            if x.ndim == 0:
+                return np.float64(self._core.scalar(float(x), t))
+            return self._core(np.ascontiguousarray(x), t)
         x = np.asarray(x, dtype=float)
         if self._x is None or t <= self._t:
             self._x, self._dx, self._t = x, np.zeros_like(x), t
@@ -35,13 +48,15 @@ class OneEuroFilter:
 
     def reset(self):
         self._x = self._dx = self._t = None
+        if self._core is not None:
+            self._core.reset()
 
 
 class LandmarkSmoother:
     """Smooths a full (N, 3) landmark array; resets automatically after a tracking dropout."""
 
-    def __init__(self, max_gap_s: float = 0.25, **kw):
-        self._f, self._kw, self._max_gap, self._last = OneEuroFilter(**kw), kw, max_gap_s, None
+    def __init__(self, max_gap_s: float = 0.25, native: bool | None = None, **kw):
+        self._f, self._kw, self._max_gap, self._last = OneEuroFilter(native=native, **kw), kw, max_gap_s, None
 
     def __call__(self, landmarks: np.ndarray, t: float) -> np.ndarray:
         if self._last is not None and t - self._last > self._max_gap:
@@ -57,12 +72,16 @@ class AngleSmoother:
     smoothing, and does it in the units that matter for driving a joint.
     """
 
-    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.02, d_cutoff: float = 1.0):
+    def __init__(self, min_cutoff: float = 1.0, beta: float = 0.02, d_cutoff: float = 1.0,
+                 native: bool | None = None):
         self._kw = dict(min_cutoff=min_cutoff, beta=beta, d_cutoff=d_cutoff)
         self._f: dict[str, OneEuroFilter] = {}
         self._last: dict[str, float] = {}
+        self._core = _native.core.AngleSmoother(min_cutoff, beta, d_cutoff) if _native.use(native) else None
 
     def __call__(self, values: dict, t: float) -> dict:
+        if self._core is not None:
+            return self._core(values, t)
         out = {}
         for k, v in values.items():
             if v is None or not np.isfinite(v):
@@ -72,7 +91,7 @@ class AngleSmoother:
                 continue
             if k in self._last:                       # unwrap next to the previous output
                 v = self._last[k] + ((v - self._last[k] + 180.0) % 360.0 - 180.0)
-            f = self._f.setdefault(k, OneEuroFilter(**self._kw))
+            f = self._f.setdefault(k, OneEuroFilter(native=False, **self._kw))
             y = float(f(v, t))
             self._last[k] = y
             out[k] = (y + 180.0) % 360.0 - 180.0 if abs(y) > 180.0 else y
@@ -81,6 +100,8 @@ class AngleSmoother:
     def reset(self):
         self._f.clear()
         self._last.clear()
+        if self._core is not None:
+            self._core.reset()
 
 
 class JitterMeter:

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from . import native as _native
 from .geometry import cross3, unit
 from .kinematics import rot_x, rot_y, rot_z
 
@@ -70,9 +71,10 @@ def _hinge(R: np.ndarray, d: np.ndarray) -> float:
 class HandKinematics:
     """Solves finger angles for one hand. Keeps the thumb rotation across frames where it is unobservable."""
 
-    def __init__(self, side: str = "right"):
+    def __init__(self, side: str = "right", native: bool | None = None):
         self.side = side
         self._tau = -np.pi / 2           # thumb bend direction in its base frame (reported rotation 0)
+        self._core = _native.core.HandSolver(side) if _native.use(native) else None
 
     def palm_coords(self, world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """(P, H): landmarks in palm coordinates (wrist at origin) and the palm frame in (mirrored) world axes."""
@@ -82,6 +84,11 @@ class HandKinematics:
 
     def solve(self, world: np.ndarray) -> dict:
         """Joint angles in degrees: {"index": {...}, ..., "thumb": {...}}."""
+        if self._core is not None:
+            a = self._core.solve(np.ascontiguousarray(world, dtype=float))
+            out = {name: dict(zip(FINGER_KEYS, a[4 * i:4 * i + 4])) for i, name in enumerate(FINGERS4)}
+            out["thumb"] = dict(zip(THUMB_KEYS, a[16:]))
+            return out
         P, _ = self.palm_coords(world)
         out = {}
         for name, (m, p, d, t) in FINGERS4.items():
