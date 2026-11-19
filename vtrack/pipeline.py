@@ -66,9 +66,67 @@ class RateMeter:
             return 1000.0 * float(np.mean([e[1] for e in self._ev])) if self._ev else float("nan")
 
 
-def open_camera(index: int = 0, width: int = 1280, height: int = 720, fps: int = 60):
-    """Open a webcam with low-latency settings; returns (capture, (actual width, height, fps))."""
+# Low-latency options for network streams (OpenCV's FFmpeg backend): no input buffering, no reordering delay.
+# Set OPENCV_FFMPEG_CAPTURE_OPTIONS yourself to override them.
+FFMPEG_LOW_LATENCY = "fflags;nobuffer|flags;low_delay|max_delay;0|reorder_queue_size;0|probesize;32768|analyzeduration;0"
+
+
+def parse_camera(spec) -> int | str:
+    """A camera number ("0", "1", ...) or a stream URL (http://, rtsp://, udp://, a file path) as given."""
+    s = str(spec).strip()
+    return int(s) if s.lstrip("-").isdigit() else s
+
+
+def open_stream(url: str):
+    """Open a phone or network camera stream with buffering turned down; returns (capture, (width, height, fps)).
+
+    Works with the stream apps that serve MJPEG over HTTP or H.264 over RTSP, for example
+    IP Webcam on Android (http://PHONE_IP:8080/video), DroidCam (http://PHONE_IP:4747/video) or an RTSP camera
+    app on iPhone (rtsp://PHONE_IP:8554/live). The camera reader keeps only the newest frame, so a stream that
+    has fallen behind catches up instead of lagging."""
+    import os
+
     import cv2
+    if url.lower().startswith(("rtsp://", "rtsps://", "udp://", "rtp://")):
+        os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS",
+                              ("rtsp_transport;tcp|" if url.lower().startswith("rtsp") else "") + FFMPEG_LOW_LATENCY)
+    cap = None
+    for be in (cv2.CAP_FFMPEG, cv2.CAP_ANY):
+        cap = cv2.VideoCapture(url, be)
+        if cap.isOpened():
+            break
+    if cap is None or not cap.isOpened():
+        return None, None
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap, (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+                 cap.get(cv2.CAP_PROP_FPS))
+
+
+def list_cameras(max_index: int = 8) -> list:
+    """[(number, width, height)] of the cameras that open and deliver a frame. On a Mac an iPhone near the
+    computer shows up here as a Continuity Camera (usually the highest number); a phone running a USB webcam app
+    (DroidCam, Iriun, Camo) shows up the same way."""
+    import cv2
+    found = []
+    for i in range(max_index + 1):
+        cap, actual = open_camera(i, 1280, 720, 30)
+        if cap is None:
+            continue
+        ok, _ = cap.read()
+        cap.release()
+        if ok:
+            found.append((i, actual[0], actual[1]))
+    cv2.destroyAllWindows()
+    return found
+
+
+def open_camera(index: int | str = 0, width: int = 1280, height: int = 720, fps: int = 60):
+    """Open a webcam with low-latency settings; returns (capture, (actual width, height, fps)).
+    A string that is not a number is opened as a stream URL (see open_stream)."""
+    import cv2
+    index = parse_camera(index)
+    if isinstance(index, str):
+        return open_stream(index)
     backends = {"win32": [cv2.CAP_DSHOW, cv2.CAP_MSMF], "darwin": [cv2.CAP_AVFOUNDATION]}.get(sys.platform, [cv2.CAP_V4L2])
     cap = None
     for be in backends + [cv2.CAP_ANY]:

@@ -37,7 +37,7 @@ recording, with a module that maps angles to 0..1 actuator commands with limits 
 - [What the camera cannot tell you](#what-the-camera-cannot-tell-you)
 - [Recording (CSV columns)](#recording-csv-columns)
 - [For the arm: what is ready and what is not](#for-the-arm-what-is-ready-and-what-is-not)
-- [Robot simulation (MuJoCo)](#robot-simulation-mujoco)
+- [Robot simulation (MuJoCo)](#robot-simulation-mujoco), [Human simulation with facial expressions](#human-simulation-with-facial-expressions), [Phone camera](#phone-camera)
 - [Jarvis: the robot's brain](#jarvis-the-robots-brain)
 - [Verify on your camera first](#verify-on-your-camera-first)
 - [Project layout](#project-layout), [Models](#models), [Tests](#tests), [Troubleshooting](#troubleshooting)
@@ -943,6 +943,57 @@ the middle of something you asked for.
 **Try saying:** "Hey Jarvis, shadow me", "stop mirroring me", "rock paper scissors?", "wave with your left hand",
 "point at me", "look at that" (after locking a gaze target), "give me a thumbs up and nod", "grip gently with your
 right hand", "copy me", "what am I holding?", "relax".
+## Human simulation with facial expressions
+
+`--sim human` shows a full human body in MuJoCo that mirrors you live: both arms and all ten fingers, both legs
+(hip 3, knee, ankle 3 each), the pelvis tilting side to side, the whole core (flexion, side bend and rotation), the
+neck, the eyes, and a face that makes your expressions.
+
+```
+python scripts/live.py --sim human                         # live: body plus a face close-up in the corner
+python scripts/live.py --sim human --face-source emotion   # face from the emotion model only
+mjpython scripts/sim.py --human                            # demo in the 3D viewer (python on Windows and Linux)
+python scripts/sim.py --human --csv recordings/run1.csv --video me.mp4
+```
+
+| Option | What it does |
+| --- | --- |
+| `--sim-mode kinematic` (default) | every joint is set straight to the tracked angle, then the body is put on the floor by its lowest foot. No servo lag: the avatar adds under 1 ms (median 0.7 ms) to the tracking latency |
+| `--sim-mode physics` | servos follow the angles under gravity, as in the robot sim (the pelvis is held in place) |
+| `--no-mirror` | copy your left and right; by default the avatar faces you and moves like your reflection |
+| `--face-source auto` (default) | each facial movement is the larger of the measured blendshape and the emotion preset |
+| `--face-source blendshapes` / `emotion` | one source only |
+| `--emotion-gain 1.25` | strength of the emotion presets (0 turns them off) |
+| `--sim-camera split` | first view; key `v` cycles split, front, face, side, three_quarter and eyes |
+
+**Where the face comes from.** The face model that tracks the head also gives MediaPipe's 52 face blendshapes
+(ARKit names: `jawOpen`, `mouthSmileLeft`, `browInnerUp`, ...). They measure each part of the face every face frame,
+so they are the accurate, low-latency source; they are now recorded as `bs_<name>` columns. The emotion model's
+seven scores drive presets built from each emotion's facial action units (FACS), so the face still shows the
+emotion when the blendshapes are missing. `vtrack/face_rig.py` holds both mappings.
+
+**The face rig.** MuJoCo has no blendshapes (morph targets), so the face is built from small jointed parts: a hinged
+jaw that also slides sideways, upper and lower lips drawn as tendons through moving points, mouth corners that rise,
+fall and stretch, cheeks that raise and puff, nostrils that sneer, three-point brows, upper and lower eyelids per eye,
+and eyes that turn. It is stylized, not photoreal. For a realistic face, send the same `bs_` values to a rigged
+character in Blender or Unity, which take ARKit blendshapes directly.
+
+**Checked against the tracker.** `tests/test_human.py` poses the body at random, reads MediaPipe-style points back
+off it, and runs them through the tracker's own leg and core solvers: every leg, pelvis and core angle comes back
+within 0.05 degrees. The arms are built by the robot's code and land within 0.01 mm of the tracker's forward
+kinematics.
+
+## Phone camera
+
+A phone camera is usually sharper and faster than a laptop webcam. From the lowest latency up:
+
+1. **iPhone and Mac: Continuity Camera.** With the iPhone near the Mac (same Apple ID, Wi-Fi and Bluetooth on), it
+   appears as a regular camera. `python scripts/live.py --list-cameras` lists the numbers; the iPhone is usually the
+   highest. Then `--camera N`. A phone mount at chest height, about 2 m away, keeps the whole body in view.
+2. **Any phone over USB:** a USB webcam app (DroidCam, Iriun, Camo) also makes the phone a regular camera number.
+3. **Any phone over Wi-Fi:** a streaming app and its URL, for example IP Webcam on Android
+   (`--camera http://PHONE_IP:8080/video`) or an RTSP camera app (`--camera rtsp://PHONE_IP:8554/live`). Buffering
+   is turned down and the reader keeps only the newest frame, but Wi-Fi still adds tens of milliseconds and jitter.
 
 ## Verify on your camera first
 
