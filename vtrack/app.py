@@ -5,8 +5,12 @@ driven headless in tests (real models on still images, or fake models).
 """
 from __future__ import annotations
 
+import collections
+import copy
 import csv
 import dataclasses
+import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -90,6 +94,8 @@ class Config:
     hand_workers: int = 1              # instances of the hand model on alternate frames (more = higher rate)
     pose_workers: int = 1              # instances of the body model
     display_hz: float = 60.0           # redraw the window at most this often; tracking and recording run at full rate
+    display_thread: bool = True        # use results on their own thread, the moment they are ready, never waiting
+                                       # for the window to be drawn (False: one loop, results used once per frame)
     gpu: bool = False                  # MediaPipe models on the graphics processor (Linux and macOS; falls back to CPU)
     sim: bool | str = False            # show a MuJoCo sim copying you in a second window: True or "robot" for the
                                        # Tandem robot, "human" for the full human body with facial expressions
@@ -214,9 +220,12 @@ class App:
         caps = {"face": cfg.face_hz, "emotion": cfg.emotion_hz, "objects": cfg.object_hz}
         floors = {"face": cfg.face_min_hz, "emotion": cfg.emotion_min_hz, "objects": cfg.object_min_hz}
         self.workers = {}
+        self.results_ready = threading.Event()          # set by a worker the moment it has a result
+        self._lock = threading.RLock()                  # the tracking state, between the tracking and window threads
+        self.result_wait = collections.deque(maxlen=2000)   # seconds each result waited before it was used
         for name, fn in self.fns.items():
             kw = dict(max_hz=caps.get(name) or None, gate=None if name in priority else self.gate,
-                      min_hz=floors.get(name, 5.0))
+                      min_hz=floors.get(name, 5.0), notify=self.results_ready)
             self.workers[name] = (WorkerGroup(name, self.camera, [fn] + self.more_fns[name], **kw)
                                   if self.more_fns[name] else ModelWorker(name, self.camera, fn, **kw))
         self._seen = {name: _Cache() for name in self.workers}
@@ -328,10 +337,16 @@ class App:
 
     def update(self) -> bool:
         """Use every new worker result in capture order (one CSV row each when recording); True when any."""
+        with self._lock:
+            return self._update()
+
+    def _update(self) -> bool:
         order = {"objects": 0, "pose": 1, "hand": 2, "face": 3, "emotion": 4}
         new = sorted(((r.t_capture, order[n], n, r) for n in order for r in self._new_results(n)),
                      key=lambda x: x[:2])
+        now = time.monotonic()
         for t, _, name, r in new:
+            self.result_wait.append(now - r.t_done)
             self._apply(name, r)
             self.data_t = t if self.data_t is None else max(self.data_t, t)
             if self.writer is not None:
@@ -1119,7 +1134,29 @@ class App:
         self.update()
         return self.render(frame)
 
-    def run(self, show=None, waitkey=None):
+    def view(self):
+        """A snapshot of the tracking state for drawing: a copy of the app whose dicts and lists are copies, taken
+        under the lock in microseconds, so the window can be drawn while the tracking thread goes on."""
+        with self._lock:
+            v = copy.copy(self)
+            for k, val in vars(self).items():
+                if type(val) is dict:
+                    setattr(v, k, {kk: dict(vv) if type(vv) is dict else list(vv) if type(vv) is list else vv
+                                   for kk, vv in val.items()})
+                elif type(val) is list:
+                    setattr(v, k, list(val))
+        return v
+
+    def _track(self):
+        """The tracking thread: use each result as soon as a worker has it."""
+        while not self._tracking_stop.is_set():
+            self.results_ready.wait(0.05)
+            self.results_ready.clear()                      # a result arriving from here on sets it again
+            self.update()
+
+    def run(self, show=None, waitkey=None, show_sim=None):
+        if self.cfg.display_thread:
+            return self._run_threaded(show, waitkey, show_sim)
         cv2 = self.cv2
         show = show or (lambda img: cv2.imshow("Tandem", img))
         waitkey = waitkey or (lambda: cv2.waitKey(1) & 0xFF)
@@ -1139,16 +1176,64 @@ class App:
                     self._last_render = now         # the window only needs the screen's rate
                     show(self.render(frame))
                     if self.sim is not None:
-                        cv2.imshow("Tandem robot", self.sim_frame(now))
+                        (show_sim or (lambda img: cv2.imshow("Tandem robot", img)))(self.sim_frame(now))
                     if not self.handle_key(waitkey()):
                         break
         finally:
             self.close()
 
-    def sim_frame(self, now: float, width: int = 640, height: int = 480):
+    def _run_threaded(self, show=None, waitkey=None, show_sim=None):
+        """Results are used on the tracking thread as they arrive; this thread draws the window from snapshots at
+        the display rate and handles keys. Python switches threads every 0.5 ms here (5 ms by default), so the
+        tracking thread gets in quickly while the window's Python code runs."""
+        cv2 = self.cv2
+        show = show or (lambda img: cv2.imshow("Tandem", img))
+        show_sim = show_sim or (lambda img: cv2.imshow("Tandem robot", img))
+        waitkey = waitkey or (lambda: cv2.waitKey(1) & 0xFF)
+        old_switch = sys.getswitchinterval()
+        sys.setswitchinterval(0.0005)
+        self._tracking_stop = threading.Event()
+        tracker = threading.Thread(target=self._track, name="tracking", daemon=True)
+        tracker.start()
+        period = 1.0 / max(1.0, self.cfg.display_hz)
+        try:
+            while True:
+                if self.camera.failed:
+                    print("The camera stopped delivering frames.")
+                    break
+                frame = self.camera.newest()
+                if frame is None:
+                    time.sleep(0.005)
+                    continue
+                now = time.monotonic()
+                self._last_render = now
+                v = self.view()
+                try:
+                    img = v.render(frame)
+                except RuntimeError as exc:                 # a shared object changed while it was drawn:
+                    if "changed size during iteration" not in str(exc):
+                        raise
+                    continue                                # draw the next one instead
+                show(img)
+                if self.sim is not None:
+                    show_sim(self.sim_frame(now, values=v.values()))
+                key = waitkey()
+                with self._lock:
+                    if not self.handle_key(key):
+                        break
+                rest = period - (time.monotonic() - now)
+                if rest > 0:
+                    time.sleep(rest)
+        finally:
+            self._tracking_stop.set()
+            tracker.join(2.0)
+            sys.setswitchinterval(old_switch)
+            self.close()
+
+    def sim_frame(self, now: float, width: int = 640, height: int = 480, values: dict | None = None):
         """Send the current angles to the simulated robot, run its physics up to now, and draw it (BGR)."""
         sim = self.sim
-        sim.command(self.values())
+        sim.command(self.values() if values is None else values)
         if self._sim_t is not None:
             sim.step(now - self._sim_t)
         self._sim_t = now
